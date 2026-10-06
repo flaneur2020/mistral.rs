@@ -375,4 +375,35 @@ impl MoEExperts {
             act: self.act,
         }
     }
+
+    /// Return the stacked quantized expert weights when they are available and held as `QTensor`s.
+    ///
+    /// Returns `Some((gate, up, down))` for gather-based (Fast) backends loaded from GGUF or ISQ,
+    /// where each tensor is the full stacked `[num_experts, out, in]` / `[num_experts, in, out]`
+    /// weight. Returns `None` for fused/grouped backends (Fused, Cutlass, Cutile — they hold
+    /// stacked dense `Tensor`s, not per-expert `QTensor`s), for BF16/F16/F32 dense weights loaded
+    /// via Fast, and for sharded (tensor-parallel) experts.
+    ///
+    /// Callers that need per-expert bytes should slice `[e·stride, (e+1)·stride)` from
+    /// `qt.data()?`; stride = `(out × in / block_size) × type_size`.
+    pub fn expert_qtensors(
+        &self,
+    ) -> Option<(
+        Arc<candle_core::quantized::QTensor>,
+        Arc<candle_core::quantized::QTensor>,
+        Arc<candle_core::quantized::QTensor>,
+    )> {
+        let MoEExpertsBackendImpl::Fast(w) = &self.backend else {
+            return None;
+        };
+        // Sharded experts produce partial sums; a cache running a subset would need an all-reduce
+        // that isn't available on the cache side.
+        if w.sharded {
+            return None;
+        }
+        let gate = w.fused_gate_proj.get_qtensor()?;
+        let up = w.fused_up_proj.get_qtensor()?;
+        let down = w.fused_down_proj.get_qtensor()?;
+        Some((gate, up, down))
+    }
 }

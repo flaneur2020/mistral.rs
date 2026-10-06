@@ -1270,23 +1270,27 @@ impl FastExpertsWeights {
                 1,
                 forward.shape.hidden_dim,
             ))?;
+            // Derive the actual top-k from the tensor rather than `config.num_experts_per_tok`
+            // so callers that pass only a subset of the routed experts (e.g. cache-miss experts in
+            // a split GPU/CPU dispatch) work correctly.
+            let top_k = forward.topk_ids.dim(D::Minus1)?;
             let indices = forward.topk_ids.reshape((
                 forward.shape.batch_size,
                 forward.shape.seq_len,
-                config.num_experts_per_tok,
+                top_k,
             ))?;
             let gate = self.fused_gate_proj.gather_forward(&xs, &indices)?;
             let up = self.fused_up_proj.gather_forward(&xs, &indices)?;
             let down_in = (up * gate.apply(&config.act)?)?;
             let inter = down_in.dim(D::Minus1)?;
             self.fused_down_proj.process_routed_stats(
-                &down_in.reshape((forward.shape.num_tokens, config.num_experts_per_tok, inter))?,
+                &down_in.reshape((forward.shape.num_tokens, top_k, inter))?,
                 ids,
             )?;
             let xs = self.fused_down_proj.gather_forward(&down_in, &indices)?;
             xs.squeeze(D::Minus2)?.reshape((
                 forward.shape.num_tokens,
-                config.num_experts_per_tok,
+                top_k,
                 forward.shape.hidden_dim,
             ))?
         };
