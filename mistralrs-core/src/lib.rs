@@ -57,6 +57,8 @@ mod metal;
 pub use metal::warmup_metal_kernels;
 mod model_loader;
 mod moe;
+pub use moe::{ExpertProjNames, MoEExperts, MoEExpertsConfig};
+pub mod moe_offload;
 mod ops;
 mod video_input;
 pub use model_loader::{

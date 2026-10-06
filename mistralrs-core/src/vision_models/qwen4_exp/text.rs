@@ -32,6 +32,7 @@ use crate::{
     },
     layers::{self, Qwen3VLRotaryEmbedding},
     moe::{MoEExperts, MoEExpertsConfig},
+    moe_offload::{routed_experts_provider, ExpertLoadContext, ExpertSite, RoutedExperts},
     paged_attention::{AttentionImplementation, ModelConfigMetadata},
     pipeline::{
         EitherCache, IsqModel, ModelForwardContext, NormalLoadingMetadata, RecurrentBatchKind,
@@ -82,9 +83,15 @@ impl GdnConfig for TextConfig {
     }
 }
 
+/// Routed experts loaded by the model, or owned by an installed `RoutedExpertsProvider`.
+enum SparseMoeExperts {
+    Builtin(MoEExperts),
+    External(Arc<dyn RoutedExperts>),
+}
+
 pub(super) struct SparseMoeBlock {
     gate: Linear,
-    experts: MoEExperts,
+    experts: SparseMoeExperts,
     shared_expert: layers::Mlp,
     shared_expert_gate: Linear,
     num_experts_per_tok: usize,
@@ -94,6 +101,7 @@ pub(super) struct SparseMoeBlock {
 impl SparseMoeBlock {
     pub(super) fn new(
         cfg: &TextConfig,
+        site: ExpertSite,
         vb: ShardedVarBuilder,
         layer_device: Device,
         loading_isq: bool,
@@ -104,21 +112,38 @@ impl SparseMoeBlock {
             cfg.num_experts,
             vb.pp("gate").set_device(layer_device.clone()),
         )?;
-        let experts = MoEExperts::new(
-            &MoEExpertsConfig {
-                num_experts: cfg.num_experts,
-                num_experts_per_tok: cfg.num_experts_per_tok,
-                hidden_size: cfg.hidden_size,
-                moe_intermediate_size: cfg.moe_intermediate_size,
-                expert_proj_names: crate::moe::ExpertProjNames::DEFAULT,
-            },
-            vb.clone(),
-            layer_device.clone(),
-            comm,
-            loading_isq,
-            &cfg.quantization_config,
-            cfg.hidden_act,
-        )?;
+        let experts_cfg = MoEExpertsConfig {
+            num_experts: cfg.num_experts,
+            num_experts_per_tok: cfg.num_experts_per_tok,
+            hidden_size: cfg.hidden_size,
+            moe_intermediate_size: cfg.moe_intermediate_size,
+            expert_proj_names: crate::moe::ExpertProjNames::DEFAULT,
+        };
+        let external = match routed_experts_provider() {
+            Some(provider) => provider.build(ExpertLoadContext {
+                site,
+                config: &experts_cfg,
+                vb: vb.clone(),
+                layer_device: &layer_device,
+                comm,
+                loading_isq,
+                quantization_config: &cfg.quantization_config,
+                act: cfg.hidden_act,
+            })?,
+            None => None,
+        };
+        let experts = match external {
+            Some(experts) => SparseMoeExperts::External(experts),
+            None => SparseMoeExperts::Builtin(MoEExperts::new(
+                &experts_cfg,
+                vb.clone(),
+                layer_device.clone(),
+                comm,
+                loading_isq,
+                &cfg.quantization_config,
+                cfg.hidden_act,
+            )?),
+        };
         let shared_expert = layers::Mlp::new(
             vb.pp("shared_expert"),
             cfg.hidden_size,
@@ -141,6 +166,11 @@ impl SparseMoeBlock {
             num_experts_per_tok: cfg.num_experts_per_tok,
             norm_topk_prob: cfg.norm_topk_prob,
         })
+    }
+
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(super) fn has_external_experts(&self) -> bool {
+        matches!(self.experts, SparseMoeExperts::External(_))
     }
 
     pub(super) fn add_residual_tensors(&self, uvb: &UnVarBuilder) {
@@ -168,8 +198,11 @@ impl SparseMoeBlock {
             None,
             None,
         )?;
-        let y = self
-            .experts
+        let experts: &dyn RoutedExperts = match &self.experts {
+            SparseMoeExperts::Builtin(experts) => experts,
+            SparseMoeExperts::External(experts) => experts.as_ref(),
+        };
+        let y = experts
             .forward(xs, topk.values, &topk.indices)?
             .reshape((b_size, seq_len, hidden_dim))?;
         let shared_gate = candle_nn::ops::sigmoid(&self.shared_expert_gate.forward(&xs_flat)?)?
@@ -341,6 +374,10 @@ impl Qwen4ExpTextModel {
             };
             let moe = SparseMoeBlock::new(
                 cfg,
+                ExpertSite {
+                    layer: layer_idx,
+                    is_mtp: false,
+                },
                 mapper.set_device(
                     layer_idx,
                     vb_layer.pp("mlp"),
@@ -704,10 +741,24 @@ impl Qwen4ExpTextModel {
     /// The decode step is graph-capturable unless PLE rows must be gathered on the host.
     #[cfg(feature = "cuda")]
     pub fn supports_decode_graphs(&self) -> bool {
+        // Externally owned experts may run off-device, which a captured graph cannot replay.
         self.layers
             .iter()
             .filter_map(|layer| layer.ple.as_ref())
             .all(PleLayer::gathers_on_device)
+            && !self.has_external_experts()
+    }
+
+    /// Whether any MoE block's routed experts belong to a `RoutedExpertsProvider`.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub fn has_external_experts(&self) -> bool {
+        self.layers
+            .iter()
+            .any(|layer| layer.moe.has_external_experts())
+            || self
+                .mtp
+                .as_ref()
+                .is_some_and(Qwen4ExpMtpHead::has_external_experts)
     }
 
     pub fn embed_tokens(&self, input_ids: &Tensor) -> Result<Tensor> {

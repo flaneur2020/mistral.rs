@@ -19,6 +19,7 @@ use super::{
 use crate::{
     device_map::DeviceMapper,
     layers::{GemmaRmsNorm, Qwen3VLRotaryEmbedding},
+    moe_offload::ExpertSite,
     paged_attention::AttentionImplementation,
     speculative::builtin_mtp::{MtpAttentionInputs, MtpDraftOutput},
     utils::unvarbuilder::UnVarBuilder,
@@ -118,6 +119,10 @@ impl Qwen4ExpMtpHead {
             mlp_hc: GatedResidual::load(cfg, vb_layer.pp("mlp_hyper_connection"), true)?,
             moe: SparseMoeBlock::new(
                 cfg,
+                ExpertSite {
+                    layer: kv_layer_idx,
+                    is_mtp: true,
+                },
                 vb_layer_quant.pp("mlp"),
                 device.clone(),
                 loading_isq,
@@ -141,6 +146,11 @@ impl Qwen4ExpMtpHead {
 
     pub(super) fn dtype(&self) -> DType {
         self.dtype
+    }
+
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(super) fn has_external_experts(&self) -> bool {
+        self.moe.has_external_experts()
     }
 
     /// Absolute paged-KV layer index the head writes to and reads from.
