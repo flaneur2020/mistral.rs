@@ -189,6 +189,42 @@ impl MoEExperts {
         Ok(Self::from_backend(backend_impl, lora_site, cfg, comm, act))
     }
 
+    /// Routed experts over stacked weights the caller already holds, on any device: `gate` and
+    /// `up` are `[num_experts, inter, hidden]`, `down` is `[num_experts, hidden, inter]`. The
+    /// tensors are shared, not copied, so later writes to their memory are seen by later
+    /// forwards. Runs the same gather backend as GGUF/ISQ experts; never sharded.
+    pub fn from_qtensors(
+        gate: Arc<candle_core::quantized::QTensor>,
+        up: Arc<candle_core::quantized::QTensor>,
+        down: Arc<candle_core::quantized::QTensor>,
+        num_experts: usize,
+        num_experts_per_tok: usize,
+        comm: &Arc<mistralrs_quant::Comm>,
+        act: Activation,
+    ) -> Result<Self> {
+        use mistralrs_quant::{GgufMatMul, QuantMethod, QuantMethodConfig};
+        let wrap = |q_weight| -> Result<Arc<dyn QuantMethod>> {
+            Ok(Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                q_weight,
+                b: None,
+            })?))
+        };
+        Ok(Self {
+            backend: MoEExpertsBackendImpl::Fast(FastExpertsWeights {
+                fused_gate_proj: wrap(gate)?,
+                fused_up_proj: wrap(up)?,
+                fused_down_proj: wrap(down)?,
+                sharded: false,
+            }),
+            lora_site: None,
+            act,
+            num_experts,
+            num_experts_per_tok,
+            all_reduce: SumAllReduce::new(comm),
+            world_size: comm.world_size(),
+        })
+    }
+
     /// Create MoEExperts from a VB already at the experts level (gemma4's flat `moe.*`, no
     /// `experts.*` sublevel).
     pub fn new_direct(
