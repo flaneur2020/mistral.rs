@@ -25,8 +25,8 @@ pub fn qtensor_indexed_moe_forward(
     x: &Tensor,
     ids: &Tensor,
 ) -> Result<Tensor> {
-    // Repacked per-expert gemv path; falls back to dequantize-and-gather only for
-    // layouts the packed kernels cannot serve. Normalize the metal/cpu 4D/5D input
+    // Repacked per-expert gemv path (aarch64), else a routed-expert gemv over the stacked
+    // blocks; falls back to dequantize-and-gather only for layouts and types neither serves. Normalize the metal/cpu 4D/5D input
     // shapes to the (tokens, x_t, hidden) form the kernel expects.
     {
         let (x3, ids2, out_shape): (Tensor, Tensor, Option<Vec<usize>>) = match *x.dims() {
@@ -58,7 +58,11 @@ pub fn qtensor_indexed_moe_forward(
             _ => (x.clone(), ids.clone(), None),
         };
         if let Some(shape) = out_shape.filter(|_| x3.rank() == 3 && ids2.rank() == 2) {
-            if let Some(out) = qtensor.indexed_gemv(&x3, &ids2)? {
+            let out = match qtensor.indexed_gemv(&x3, &ids2)? {
+                Some(out) => Some(out),
+                None => routed_gemv(qtensor, &x3, &ids2)?,
+            };
+            if let Some(out) = out {
                 return if shape.is_empty() {
                     Ok(out)
                 } else {
@@ -67,10 +71,6 @@ pub fn qtensor_indexed_moe_forward(
                 };
             }
         }
-    }
-
-    if let Some(out) = routed_gemv(qtensor, x, ids)? {
-        return Ok(out);
     }
 
     let device = x.device();
@@ -217,6 +217,27 @@ mod tests {
     };
 
     use super::routed_gemv;
+
+    /// The public entry point takes the model's 4D (`[b, s, x_t, h]`) activations, in BF16, and
+    /// must reach the routed gemv rather than the dequantize fallback.
+    #[test]
+    fn indexed_moe_forward_serves_4d_bf16_input() {
+        let (e, n, k) = (4, 16, 256);
+        let w: Vec<f32> = (0..e * n * k)
+            .map(|i| ((i as f32) * 0.37).sin() * 0.5)
+            .collect();
+        let w = Tensor::from_vec(w, (e, n, k), &Device::Cpu).unwrap();
+        let q = std::sync::Arc::new(QTensor::quantize(&w, GgmlDType::Q4K).unwrap());
+        let x: Vec<f32> = (0..2 * k).map(|i| ((i as f32) * 0.11).cos()).collect();
+        let x = Tensor::from_vec(x, (1, 2, 1, k), &Device::Cpu)
+            .unwrap()
+            .to_dtype(candle_core::DType::BF16)
+            .unwrap();
+        let ids = Tensor::new(&[[[1u32, 3], [0, 2]]], &Device::Cpu).unwrap();
+        let out = super::qtensor_indexed_moe_forward(&q, &x, &ids).unwrap();
+        assert_eq!(out.dims(), &[1, 2, 2, n]);
+        assert_eq!(out.dtype(), candle_core::DType::BF16);
+    }
 
     /// Each routed slot must equal running its expert's own `QMatMul` on the same row.
     #[test]
