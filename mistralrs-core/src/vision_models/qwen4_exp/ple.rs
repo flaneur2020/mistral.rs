@@ -558,6 +558,24 @@ impl PleTable {
         })
     }
 
+    /// Turn off readahead on a GGUF table the host gathers from: each row is a few hundred bytes
+    /// at a hashed offset, so the default readahead reads ~100x more than it uses and evicts the
+    /// rows other tokens need.
+    fn advise_random_access(&self) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        if let TableSource::Gguf { archive, .. } = &self.source {
+            let data = archive.tensor_data(GGUF_TABLE_NAME)?.bytes();
+            let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(1) as usize;
+            let start = data.as_ptr() as usize / page * page;
+            let len = data.as_ptr() as usize + data.len() - start;
+            // SAFETY: the range covers mapped pages of `data`; the advice does not change contents.
+            unsafe {
+                libc::madvise(start as *mut libc::c_void, len, libc::MADV_RANDOM);
+            }
+        }
+        Ok(())
+    }
+
     /// Host gather of `rows` into a `[rows.len(), head_dim]` tensor on `device`.
     fn gather_host(&self, rows: &[u64], device: &Device) -> Result<Tensor> {
         let outside = |row: u64| {
@@ -587,16 +605,22 @@ impl PleTable {
                     .to_device(device)
             }
             TableSource::Gguf { archive, .. } => {
+                use rayon::prelude::*;
                 let row_bytes = iq4_nl_row_bytes(self.head_dim);
                 let bytes = archive.tensor_data(GGUF_TABLE_NAME)?.bytes();
                 let mut out = vec![0f32; rows.len() * self.head_dim];
-                for (dst, &row) in out.chunks_exact_mut(self.head_dim).zip(rows) {
-                    let offset = row as usize * row_bytes;
-                    let src = bytes
-                        .get(offset..offset + row_bytes)
-                        .ok_or_else(|| outside(row))?;
-                    dequantize_iq4_nl_row(src, dst);
-                }
+                // Rows are hashed, so each one is a random read of a table that is usually
+                // larger than RAM: fault them in from many threads to keep the disk queue full.
+                out.par_chunks_exact_mut(self.head_dim)
+                    .zip(rows.par_iter())
+                    .try_for_each(|(dst, &row)| {
+                        let offset = row as usize * row_bytes;
+                        let src = bytes
+                            .get(offset..offset + row_bytes)
+                            .ok_or_else(|| outside(row))?;
+                        dequantize_iq4_nl_row(src, dst);
+                        Ok::<_, candle_core::Error>(())
+                    })?;
                 Tensor::from_vec(out, (rows.len(), self.head_dim), device)
             }
         }
@@ -817,11 +841,15 @@ impl PleLayer {
     pub(super) fn make_table_resident(&mut self, device: &Device) -> Result<()> {
         #[cfg(feature = "cuda")]
         if device.is_cuda() {
-            return self.table.make_resident(device);
+            self.table.make_resident(device)?;
+            if !self.gathers_on_device() {
+                self.table.advise_random_access()?;
+            }
+            return Ok(());
         }
         let _ = device;
         tracing::info!("Qwen4-Exp PLE rows are gathered from the memory-mapped table on the host");
-        Ok(())
+        self.table.advise_random_access()
     }
 
     /// `hidden_states + ple(hidden_states, tokens)`, advancing the per-sequence state. `conv_inputs_out`
