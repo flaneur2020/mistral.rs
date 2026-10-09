@@ -139,6 +139,10 @@ fn routed_gemv(qtensor: &QTensor, x: &Tensor, ids: &Tensor) -> Result<Option<Ten
     Ok(Some(out.to_dtype(x.dtype())?))
 }
 
+/// Output rows per rayon task in `gemv`: enough to amortize a task, few enough that one expert
+/// spreads over every thread (decode rows are 640-2560 long here).
+const ROWS_PER_TASK: usize = 32;
+
 /// `dst[t, j, :] = W[ids[t, j]] · x[t, j or 0]` with `W` the `[E, n, k]` blocks of type `T`.
 fn gemv<T: GgmlType>(
     data: &[u8],
@@ -174,14 +178,20 @@ fn gemv<T: GgmlType>(
         .for_each(|(dst, src)| T::VecDotType::from_float(src, dst));
 
     let mut dst = vec![0f32; tokens * topk * n];
+    // Rows are split too: a decode step often routes only a couple of experts here (the rest
+    // run elsewhere), which would otherwise leave all but a couple of threads idle.
     dst.par_chunks_mut(n).enumerate().for_each(|(slot, out)| {
         let (t, j) = (slot / topk, slot % topk);
         let xrow = t * x_t + if x_t == 1 { 0 } else { j };
         let x = &xq[xrow * vd_row..(xrow + 1) * vd_row];
         let w = &blocks[ids[slot] as usize * expert_blocks..][..expert_blocks];
-        for (o, row) in out.iter_mut().zip(w.chunks_exact(row_blocks)) {
-            *o = T::vec_dot(k, row, x);
-        }
+        out.par_chunks_mut(ROWS_PER_TASK)
+            .zip(w.par_chunks(ROWS_PER_TASK * row_blocks))
+            .for_each(|(out, w)| {
+                for (o, row) in out.iter_mut().zip(w.chunks_exact(row_blocks)) {
+                    *o = T::vec_dot(k, row, x);
+                }
+            });
     });
     Ok(dst)
 }
