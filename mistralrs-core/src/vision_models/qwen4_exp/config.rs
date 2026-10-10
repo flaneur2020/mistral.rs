@@ -108,6 +108,13 @@ pub struct TextConfig {
     pub mtp_num_hidden_layers: usize,
     #[serde(default)]
     pub mtp_use_dedicated_embeddings: bool,
+    /// Routed experts of the MTP draft block, when it differs from the target's.
+    ///
+    /// Qwen3.8-Flash-Next Coder keeps the checkpoint's 512-expert head while the pruned target
+    /// routes 256, and the head routes its own experts, so it needs its own count. `None` follows
+    /// the target, which is what a safetensors checkpoint always does.
+    #[serde(default)]
+    pub mtp_num_experts: Option<usize>,
     #[serde(default)]
     pub quantization_config: Option<QuantizedConfig>,
     #[serde(default, rename = "_mistralrs_gdn_v_head_layout")]
@@ -396,6 +403,12 @@ impl TextConfig {
         } else {
             0
         }
+    }
+
+    /// Routed experts in the MTP draft block: its own count when the checkpoint states one,
+    /// otherwise the target's.
+    pub fn mtp_experts(&self) -> usize {
+        self.mtp_num_experts.unwrap_or(self.num_experts)
     }
 
     /// Paged-KV layer kinds: the main stack, then any MTP blocks (all QSA attention) after it.

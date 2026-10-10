@@ -107,13 +107,19 @@ impl SparseMoeBlock {
         loading_isq: bool,
         comm: &Arc<mistralrs_quant::Comm>,
     ) -> Result<Self> {
+        // The MTP draft block has its own router and experts, and its expert count can differ from
+        // the target's (Coder prunes the target to 256, the head keeps the checkpoint's 512).
+        let num_experts = match site.is_mtp {
+            true => cfg.mtp_experts(),
+            false => cfg.num_experts,
+        };
         let gate = layers::linear_no_bias(
             cfg.hidden_size,
-            cfg.num_experts,
+            num_experts,
             vb.pp("gate").set_device(layer_device.clone()),
         )?;
         let experts_cfg = MoEExpertsConfig {
-            num_experts: cfg.num_experts,
+            num_experts,
             num_experts_per_tok: cfg.num_experts_per_tok,
             hidden_size: cfg.hidden_size,
             moe_intermediate_size: cfg.moe_intermediate_size,

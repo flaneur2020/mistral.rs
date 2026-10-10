@@ -168,6 +168,9 @@ pub(crate) fn build_qwen4exp_bindings(archive: &GgufArchive) -> Result<GgufBindi
         bind_experts(&inventory, &native, &source, &mut bindings);
         bind_shared_expert(&inventory, &native, &source, &mut bindings)?;
     }
+    if let Some(block) = mtp_head_block(archive) {
+        bind_mtp_head(&inventory, block, &mut bindings)?;
+    }
     if has_projector(archive) {
         match archive.metadata_value(PROJECTOR_TYPE) {
             Some(Value::String(projector)) if projector == QWEN3_VL_PROJECTOR => {}
@@ -179,6 +182,128 @@ pub(crate) fn build_qwen4exp_bindings(archive: &GgufArchive) -> Result<GgufBindi
         bind_qwen3_vision(&inventory, deepstack.as_deref(), &mut bindings)?;
     }
     Ok(bindings)
+}
+
+/// The GGUF block holding the MTP head, when the checkpoint ships (or a component merges in) one.
+///
+/// A merged component keeps the upstream `blk.<block_count>.*` names, which is one past the target's
+/// last decoder block: `qwen4exp.block_count` counts the target only. Look for the head's own
+/// `nextn.eh_proj` rather than trusting a block index.
+fn mtp_head_block(archive: &GgufArchive) -> Option<usize> {
+    let nextn = metadata_usize(archive, &format!("{ARCHITECTURE}.nextn_predict_layers")).ok()?;
+    // llama.cpp numbers MTP blocks right after the decoder stack.
+    let block = metadata_usize(archive, &format!("{ARCHITECTURE}.block_count")).ok()?;
+    (1..=nextn).rev().find_map(|offset| {
+        let candidate = block + offset - 1;
+        archive
+            .contains_tensor(&format!("blk.{candidate}.nextn.eh_proj.weight"))
+            .then_some(candidate)
+    })
+}
+
+/// Native names for the MTP draft block, whose GGUF tensors live at `blk.<block>.*`.
+///
+/// `block` is the GGUF block index; the head's native layers are always `mtp.layers.0`.
+fn bind_mtp_head(
+    inventory: &TensorInventory,
+    block: usize,
+    bindings: &mut GgufBindingMap,
+) -> Result<()> {
+    let source = format!("blk.{block}");
+    let native = "mtp.layers.0";
+    for (target, role) in LAYER_TENSORS {
+        bind(
+            inventory,
+            bindings,
+            format!("{native}.{target}"),
+            format!("{source}.{role}"),
+        );
+    }
+    for (target, role) in SHIFTED_NORMS {
+        bind_shifted_norm(
+            inventory,
+            bindings,
+            format!("{native}.{target}"),
+            format!("{source}.{role}"),
+        );
+    }
+    let q = format!("{source}.indexer.q_proj.weight");
+    let k = format!("{source}.indexer.k_proj.weight");
+    if inventory.contains(&q) && inventory.contains(&k) {
+        bindings.insert(
+            format!("{native}.self_attn.indexer.index_qk_proj.weight"),
+            GgufTensorBinding::concat(
+                vec![GgufTensorBinding::tensor(q), GgufTensorBinding::tensor(k)],
+                0,
+            ),
+        );
+    }
+    bind_experts(inventory, native, &source, bindings);
+    bind_shared_expert(inventory, native, &source, bindings)?;
+    // The pre-mixer hyper-connection and the two fc halves have no per-layer counterpart; they use
+    // the `nextn.` names and are the only tensors of the head that mistral.rs reads outside
+    // `mtp.layers.0`. `eh_proj` fuses the checkpoint's two [n, n] projections along the axis that
+    // GGUF stores first (ne0), i.e. their shared *input* axis, so it reads as a `[n, 2n]` matrix
+    // here and each projection is a slice over dim 1 — `fc_embedding` first, then `fc_hidden`.
+    bind_shifted_norm(
+        inventory,
+        bindings,
+        "mtp.hyper_connection_mixer.hc_norm.weight".to_string(),
+        format!("{source}.nextn.hc_head_norm.weight"),
+    );
+    bind(
+        inventory,
+        bindings,
+        "mtp.hyper_connection_mixer.input_mix_weight_down.weight",
+        format!("{source}.nextn.hc_head_down.weight"),
+    );
+    bind(
+        inventory,
+        bindings,
+        "mtp.hyper_connection_mixer.input_mix_weight_up.weight",
+        format!("{source}.nextn.hc_head_up.weight"),
+    );
+    // The head's own norms are stored shifted (`1 + w`) like every other norm in this GGUF.
+    bind_shifted_norm(
+        inventory,
+        bindings,
+        "mtp.pre_fc_norm_embedding.weight".to_string(),
+        format!("{source}.nextn.enorm.weight"),
+    );
+    bind_shifted_norm(
+        inventory,
+        bindings,
+        "mtp.pre_fc_norm_hidden.weight".to_string(),
+        format!("{source}.nextn.hnorm.weight"),
+    );
+    let eh = format!("{source}.nextn.eh_proj.weight");
+    if inventory.contains(&eh) {
+        // `shape()` reverses the file's ne0-first order, so this reads as `[hidden, 2 * hidden]`:
+        // the checkpoint's two `[hidden, hidden]` projections were fused along their shared input
+        // axis, which lands on dim 1. `fc_embedding` is the first half and `fc_hidden` the second
+        // (checked against the BF16 checkpoint), and each half is already `[in, out]` as
+        // `ReplicatedLayer` wants it, so neither needs a transpose.
+        let &[hidden, fused_len] = inventory.shape(&eh)? else {
+            bail!(
+                "Qwen4-Exp MTP `{eh}` must be rank 2, got {} dimensions",
+                inventory.shape(&eh)?.len()
+            );
+        };
+        if fused_len % 2 != 0 || hidden == 0 {
+            bail!("Qwen4-Exp MTP `{eh}` must fuse two equal projections, got [{hidden}, {fused_len}]");
+        }
+        let half = fused_len / 2;
+        let fused = GgufTensorBinding::tensor(&eh);
+        bindings.insert(
+            "mtp.fc_embedding.weight".to_string(),
+            fused.clone().slice(1, 0, half),
+        );
+        bindings.insert(
+            "mtp.fc_hidden.weight".to_string(),
+            fused.slice(1, half, half),
+        );
+    }
+    Ok(())
 }
 
 fn bind_shifted_norm(
@@ -361,6 +486,23 @@ fn synthesize_config(archive: &GgufArchive) -> Result<JsonValue> {
         ),
         ("indexer_compress_ratio".into(), json!(compress_ratio)),
     ]);
+    // An MTP head merged in as a component states its own counts under `qwen4exp.mtp.*`: the
+    // matching unsuffixed keys already hold the target's values and must not be overwritten.
+    if archive
+        .metadata_value(&key("mtp.expert_count"))
+        .is_some()
+    {
+        text.extend([
+            (
+                "mtp_num_experts".into(),
+                json!(metadata_usize(archive, &key("mtp.expert_count"))?),
+            ),
+            (
+                "mtp_num_hidden_layers".into(),
+                json!(metadata_usize(archive, &key("nextn_predict_layers"))?),
+            ),
+        ]);
+    }
     if let Some(ple_layers) = archive
         .metadata_value(&key("ple.layers"))
         .map(|_| u64_array(archive, &key("ple.layers")))

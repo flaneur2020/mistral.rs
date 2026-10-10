@@ -160,6 +160,7 @@ pub struct GGUFLoader {
     config: GGUFSpecificConfig,
     jinja_explicit: Option<String>,
     encoder_cache_memory_bytes: Option<usize>,
+    mtp: bool,
 }
 
 #[derive(Clone, Default)]
@@ -306,6 +307,7 @@ pub struct GGUFLoaderBuilder {
     config: GGUFSpecificConfig,
     jinja_explicit: Option<String>,
     encoder_cache_memory_bytes: Option<usize>,
+    mtp: bool,
 }
 
 impl GGUFLoaderBuilder {
@@ -334,12 +336,19 @@ impl GGUFLoaderBuilder {
             config,
             jinja_explicit,
             no_kv_cache,
+            mtp: false,
             ..Default::default()
         }
     }
 
     pub fn with_mmproj_files(mut self, mmproj_filenames: Vec<String>) -> Self {
         self.mmproj_filenames = Some(mmproj_filenames);
+        self
+    }
+
+    /// Load the MTP draft block the checkpoint carries (or that an `mmproj` component merges in).
+    pub fn with_mtp(mut self, mtp: bool) -> Self {
+        self.mtp = mtp;
         self
     }
 
@@ -433,6 +442,7 @@ impl GGUFLoaderBuilder {
             config: self.config,
             jinja_explicit: self.jinja_explicit,
             encoder_cache_memory_bytes: self.encoder_cache_memory_bytes,
+            mtp: self.mtp,
         })
     }
 }
@@ -479,6 +489,7 @@ impl GGUFLoader {
             config,
             jinja_explicit,
             encoder_cache_memory_bytes: None,
+            mtp: false,
         }
     }
 
@@ -864,6 +875,7 @@ impl GGUFLoader {
             Some(self.quantized_model_id.clone()),
             self.jinja_explicit.clone(),
         )
+        .with_mtp(self.mtp)
         .with_encoder_cache_memory_bytes(self.encoder_cache_memory_bytes);
         if let Some(dynamic_lora) = self.dynamic_lora.as_ref() {
             loader = loader.with_lora(dynamic_lora.adapters.clone(), dynamic_lora.runtime);
@@ -1015,6 +1027,7 @@ impl GGUFLoader {
             Some(self.quantized_model_id.clone()),
             self.jinja_explicit.clone(),
         )
+        .with_mtp(self.mtp)
         .with_encoder_cache_memory_bytes(self.encoder_cache_memory_bytes);
         if let Some(dynamic_lora) = self.dynamic_lora.as_ref() {
             loader = loader.with_lora(dynamic_lora.adapters.clone(), dynamic_lora.runtime);
