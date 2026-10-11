@@ -96,6 +96,7 @@ fn routed_gemv(qtensor: &QTensor, x: &Tensor, ids: &Tensor) -> Result<Option<Ten
     use candle_core::quantized::{k_quants::*, GgmlDType};
 
     use super::iq2s::BlockIQ2S;
+    use super::iq3s::BlockIQ3S;
     use super::iq3xxs::BlockIQ3XXS;
     use super::iq4nl::BlockIQ4NL;
     use super::iq4xs::BlockIQ4XS;
@@ -144,6 +145,7 @@ fn routed_gemv(qtensor: &QTensor, x: &Tensor, ids: &Tensor) -> Result<Option<Ten
         GgmlDType::Q2_0 => gemv::<BlockQ2_0>(&data, &xs, &ids, (tokens, x_t, topk, n, k))?,
         GgmlDType::IQ3_XXS => gemv::<BlockIQ3XXS>(&data, &xs, &ids, (tokens, x_t, topk, n, k))?,
         GgmlDType::IQ2_S => gemv::<BlockIQ2S>(&data, &xs, &ids, (tokens, x_t, topk, n, k))?,
+        GgmlDType::IQ3_S => gemv::<BlockIQ3S>(&data, &xs, &ids, (tokens, x_t, topk, n, k))?,
         _ => return Ok(None),
     };
     let out = Tensor::from_vec(dst, (tokens, topk, n), x.device())?;

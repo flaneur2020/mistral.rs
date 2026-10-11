@@ -1320,7 +1320,8 @@ impl TryFrom<GgmlDType> for IsqType {
             | GgmlDType::IQ4NL
             | GgmlDType::Q2_0
             | GgmlDType::IQ3_XXS
-            | GgmlDType::IQ2_S => {
+            | GgmlDType::IQ2_S
+            | GgmlDType::IQ3_S => {
                 candle_core::bail!("Expected valid GGML ISQ type.")
             }
         }

@@ -57,7 +57,8 @@ impl AffineFormatSpec {
             | GgmlDType::IQ4NL
             | GgmlDType::Q2_0
             | GgmlDType::IQ3_XXS
-            | GgmlDType::IQ2_S => return None,
+            | GgmlDType::IQ2_S
+            | GgmlDType::IQ3_S => return None,
         };
         Some(Self {
             source_dtype,

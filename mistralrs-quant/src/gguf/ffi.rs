@@ -241,6 +241,19 @@ extern "C" {
         input_dim1: i32,
         stream: *mut c_void,
     );
+    pub fn launch_indexed_moe_forward_iq3s_q8_1(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        input_dim1: i32,
+        stream: *mut c_void,
+    );
     pub fn launch_indexed_moe_forward_q2_0_q8_1(
         all_weights: *const c_void,
         all_inputs: *const c_void,
@@ -648,6 +661,21 @@ extern "C" {
         input_dim1: i32,
         stream: *mut c_void,
     );
+    pub fn launch_moe_grouped_gemm_iq3s(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        expert_bounds: *const i32,
+        sorted_token_ids: *const i32,
+        topk_weights: *const f32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        k_padded: i32,
+        num_experts: i32,
+        topk: i32,
+        input_dim1: i32,
+        stream: *mut c_void,
+    );
     pub fn launch_moe_grouped_gemm_q2_0(
         all_weights: *const c_void,
         all_inputs: *const c_void,
@@ -868,6 +896,20 @@ extern "C" {
         stream: *mut c_void,
     );
     pub fn launch_moe_gemv_fused_gate_up_iq2s_q8_1(
+        gate_weights: *const c_void,
+        up_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        act_type: i32,
+        stream: *mut c_void,
+    );
+    pub fn launch_moe_gemv_fused_gate_up_iq3s_q8_1(
         gate_weights: *const c_void,
         up_weights: *const c_void,
         all_inputs: *const c_void,
@@ -1141,6 +1183,19 @@ extern "C" {
         k_padded: i32,
         stream: *mut c_void,
     );
+    pub fn launch_moe_gemv_down_aggregate_iq3s_q8_1(
+        all_weights: *const c_void,
+        all_inputs: *const c_void,
+        indices: *const u32,
+        topk_weights: *const f32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        stream: *mut c_void,
+    );
     pub fn launch_moe_gemv_down_aggregate_q2_0_q8_1(
         all_weights: *const c_void,
         all_inputs: *const c_void,
@@ -1302,6 +1357,17 @@ extern "C" {
         stream: *mut c_void,
     );
     pub fn launch_mmvq_gguf_iq2s_bf16_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
+    pub fn launch_mmvq_gguf_iq3s_bf16_plain(
         vx: *const c_void,
         vy: *const c_void,
         dst: *mut c_void,
@@ -1479,6 +1545,17 @@ extern "C" {
         b_size: i32,
         stream: *mut c_void,
     );
+    pub fn launch_mmvq_gguf_iq3s_f32_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
     pub fn launch_mmvq_gguf_q2_0_f32_plain(
         vx: *const c_void,
         vy: *const c_void,
@@ -1646,6 +1723,17 @@ extern "C" {
         b_size: i32,
         stream: *mut c_void,
     );
+    pub fn launch_mmvq_gguf_iq3s_f16_plain(
+        vx: *const c_void,
+        vy: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        stride_col_y: i32,
+        stride_col_dst: i32,
+        b_size: i32,
+        stream: *mut c_void,
+    );
     pub fn launch_mmvq_gguf_q2_0_f16_plain(
         vx: *const c_void,
         vy: *const c_void,
@@ -1672,6 +1760,7 @@ extern "C" {
     declare_mmvq_fused_glu!(launch_mmvq_gguf_iq4nl_bf16_fused_glu);
     declare_mmvq_fused_glu!(launch_mmvq_gguf_iq3xxs_bf16_fused_glu);
     declare_mmvq_fused_glu!(launch_mmvq_gguf_iq2s_bf16_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_iq3s_bf16_fused_glu);
     declare_mmvq_fused_glu!(launch_mmvq_gguf_q2_0_bf16_fused_glu);
 
     declare_mmvq_fused_glu!(launch_mmvq_gguf_q4_0_f16_fused_glu);
@@ -1688,6 +1777,7 @@ extern "C" {
     declare_mmvq_fused_glu!(launch_mmvq_gguf_iq4nl_f16_fused_glu);
     declare_mmvq_fused_glu!(launch_mmvq_gguf_iq3xxs_f16_fused_glu);
     declare_mmvq_fused_glu!(launch_mmvq_gguf_iq2s_f16_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_iq3s_f16_fused_glu);
     declare_mmvq_fused_glu!(launch_mmvq_gguf_q2_0_f16_fused_glu);
 
     declare_mmvq_fused_glu!(launch_mmvq_gguf_q4_0_f32_fused_glu);
@@ -1704,6 +1794,7 @@ extern "C" {
     declare_mmvq_fused_glu!(launch_mmvq_gguf_iq4nl_f32_fused_glu);
     declare_mmvq_fused_glu!(launch_mmvq_gguf_iq3xxs_f32_fused_glu);
     declare_mmvq_fused_glu!(launch_mmvq_gguf_iq2s_f32_fused_glu);
+    declare_mmvq_fused_glu!(launch_mmvq_gguf_iq3s_f32_fused_glu);
     declare_mmvq_fused_glu!(launch_mmvq_gguf_q2_0_f32_fused_glu);
 
     declare_mmvq_fused_qkv!(launch_mmvq_gguf_q4_0_bf16_fused_qkv);
@@ -1720,6 +1811,7 @@ extern "C" {
     declare_mmvq_fused_qkv!(launch_mmvq_gguf_iq4nl_bf16_fused_qkv);
     declare_mmvq_fused_qkv!(launch_mmvq_gguf_iq3xxs_bf16_fused_qkv);
     declare_mmvq_fused_qkv!(launch_mmvq_gguf_iq2s_bf16_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_iq3s_bf16_fused_qkv);
     declare_mmvq_fused_qkv!(launch_mmvq_gguf_q2_0_bf16_fused_qkv);
 
     declare_mmvq_fused_qkv!(launch_mmvq_gguf_q4_0_f16_fused_qkv);
@@ -1736,6 +1828,7 @@ extern "C" {
     declare_mmvq_fused_qkv!(launch_mmvq_gguf_iq4nl_f16_fused_qkv);
     declare_mmvq_fused_qkv!(launch_mmvq_gguf_iq3xxs_f16_fused_qkv);
     declare_mmvq_fused_qkv!(launch_mmvq_gguf_iq2s_f16_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_iq3s_f16_fused_qkv);
     declare_mmvq_fused_qkv!(launch_mmvq_gguf_q2_0_f16_fused_qkv);
 
     declare_mmvq_fused_qkv!(launch_mmvq_gguf_q4_0_f32_fused_qkv);
@@ -1752,6 +1845,7 @@ extern "C" {
     declare_mmvq_fused_qkv!(launch_mmvq_gguf_iq4nl_f32_fused_qkv);
     declare_mmvq_fused_qkv!(launch_mmvq_gguf_iq3xxs_f32_fused_qkv);
     declare_mmvq_fused_qkv!(launch_mmvq_gguf_iq2s_f32_fused_qkv);
+    declare_mmvq_fused_qkv!(launch_mmvq_gguf_iq3s_f32_fused_qkv);
     declare_mmvq_fused_qkv!(launch_mmvq_gguf_q2_0_f32_fused_qkv);
 
     /// BF16 -> Q8_1 quantize
