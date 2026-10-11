@@ -22,6 +22,8 @@ use candle_core::{
 use half::{bf16, f16};
 use memmap2::{Mmap, MmapOptions};
 
+use super::iq4xs::{self, BlockIQ4XS};
+
 const DEFAULT_ALIGNMENT: usize = 32;
 const MAX_STRING_LENGTH: u64 = 1 << 30;
 const MAX_ARRAY_ELEMENTS: u64 = 1 << 30;
@@ -175,6 +177,7 @@ impl GgufDType {
             13 => GgmlDType::Q5K,
             14 => GgmlDType::Q6K,
             15 => GgmlDType::Q8K,
+            23 => GgmlDType::IQ4XS,
             30 => GgmlDType::BF16,
             raw => candle_core::bail!("GGUF dtype {raw} is not supported by Candle"),
         };
@@ -599,7 +602,11 @@ pub(super) fn qtensor_from_gguf_data(
             data.len()
         );
     }
-    let storage = if data.as_ptr().align_offset(ggml_dtype_alignment(dtype)) == 0 {
+    let storage = if dtype == GgmlDType::IQ4XS {
+        // candle-core has no block type for this one, so its own storage is a
+        // stub; build the IQ4_XS storage from here instead.
+        iq4xs::storage_for_device(data, device)?
+    } else if data.as_ptr().align_offset(ggml_dtype_alignment(dtype)) == 0 {
         QStorage::from_data(Cow::Borrowed(data), device, dtype)?
     } else {
         let mut aligned = vec![0u128; data.len().div_ceil(size_of::<u128>())];
@@ -626,6 +633,7 @@ const fn ggml_dtype_alignment(dtype: GgmlDType) -> usize {
         GgmlDType::Q5K => align_of::<BlockQ5K>(),
         GgmlDType::Q6K => align_of::<BlockQ6K>(),
         GgmlDType::Q8K => align_of::<BlockQ8K>(),
+        GgmlDType::IQ4XS => align_of::<BlockIQ4XS>(),
         GgmlDType::BF16 => align_of::<bf16>(),
     }
 }

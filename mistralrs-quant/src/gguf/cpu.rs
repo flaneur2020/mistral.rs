@@ -95,6 +95,8 @@ pub fn qtensor_indexed_moe_forward(
 fn routed_gemv(qtensor: &QTensor, x: &Tensor, ids: &Tensor) -> Result<Option<Tensor>> {
     use candle_core::quantized::{k_quants::*, GgmlDType};
 
+    use super::iq4xs::BlockIQ4XS;
+
     if !x.device().is_cpu() || !qtensor.device().is_cpu() {
         return Ok(None);
     }
@@ -133,15 +135,12 @@ fn routed_gemv(qtensor: &QTensor, x: &Tensor, ids: &Tensor) -> Result<Option<Ten
         GgmlDType::Q4K => gemv::<BlockQ4K>(&data, &xs, &ids, (tokens, x_t, topk, n, k))?,
         GgmlDType::Q5K => gemv::<BlockQ5K>(&data, &xs, &ids, (tokens, x_t, topk, n, k))?,
         GgmlDType::Q6K => gemv::<BlockQ6K>(&data, &xs, &ids, (tokens, x_t, topk, n, k))?,
+        GgmlDType::IQ4XS => gemv::<BlockIQ4XS>(&data, &xs, &ids, (tokens, x_t, topk, n, k))?,
         _ => return Ok(None),
     };
     let out = Tensor::from_vec(dst, (tokens, topk, n), x.device())?;
     Ok(Some(out.to_dtype(x.dtype())?))
 }
-
-/// Output rows per rayon task in `gemv`: enough to amortize a task, few enough that one expert
-/// spreads over every thread (decode rows are 640-2560 long here).
-const ROWS_PER_TASK: usize = 32;
 
 /// `dst[t, j, :] = W[ids[t, j]] · x[t, j or 0]` with `W` the `[E, n, k]` blocks of type `T`.
 fn gemv<T: GgmlType>(
@@ -178,20 +177,14 @@ fn gemv<T: GgmlType>(
         .for_each(|(dst, src)| T::VecDotType::from_float(src, dst));
 
     let mut dst = vec![0f32; tokens * topk * n];
-    // Rows are split too: a decode step often routes only a couple of experts here (the rest
-    // run elsewhere), which would otherwise leave all but a couple of threads idle.
     dst.par_chunks_mut(n).enumerate().for_each(|(slot, out)| {
         let (t, j) = (slot / topk, slot % topk);
         let xrow = t * x_t + if x_t == 1 { 0 } else { j };
         let x = &xq[xrow * vd_row..(xrow + 1) * vd_row];
         let w = &blocks[ids[slot] as usize * expert_blocks..][..expert_blocks];
-        out.par_chunks_mut(ROWS_PER_TASK)
-            .zip(w.par_chunks(ROWS_PER_TASK * row_blocks))
-            .for_each(|(out, w)| {
-                for (o, row) in out.iter_mut().zip(w.chunks_exact(row_blocks)) {
-                    *o = T::vec_dot(k, row, x);
-                }
-            });
+        for (o, row) in out.iter_mut().zip(w.chunks_exact(row_blocks)) {
+            *o = T::vec_dot(k, row, x);
+        }
     });
     Ok(dst)
 }
@@ -312,6 +305,60 @@ mod tests {
                             "{dtype:?} x_t={x_t} slot ({t},{j}) diverges by {diff}"
                         );
                     }
+                }
+            }
+        }
+    }
+
+    /// IQ4_XS is not a candle type: `iq4xs` builds its storage and implements `GgmlType`, and
+    /// the routed gemv has to serve it like any other GGUF block type.
+    #[test]
+    fn routed_gemv_serves_iq4xs_experts() {
+        use crate::gguf::iq4xs::{self, BLOCK_BYTES, QK_K};
+
+        let (e, n, k, tokens, topk) = (4, 16, 256, 3, 2);
+        let row_bytes = (k / QK_K) * BLOCK_BYTES;
+        let w: Vec<f32> = (0..e * n * k)
+            .map(|i| ((i as f32) * 0.37).sin() * 0.5)
+            .collect();
+        let mut packed = vec![0u8; e * n * row_bytes];
+        for row in 0..e * n {
+            iq4xs::quantize_iq4_xs(
+                &w[row * k..(row + 1) * k],
+                &mut packed[row * row_bytes..(row + 1) * row_bytes],
+            )
+            .unwrap();
+        }
+        let qt = std::sync::Arc::new(
+            QTensor::new(iq4xs::cpu_storage(&packed).unwrap(), (e, n, k)).unwrap(),
+        );
+
+        let ids = Tensor::new(&[[0u32, 2], [3, 1], [2, 2]], &Device::Cpu).unwrap();
+        let x: Vec<f32> = (0..tokens * k).map(|i| ((i as f32) * 0.11).cos()).collect();
+        let x = Tensor::from_vec(x, (tokens, 1, k), &Device::Cpu).unwrap();
+        let got = super::qtensor_indexed_moe_forward(&qt, &x, &ids).unwrap();
+        assert_eq!(got.dims(), &[tokens, topk, n]);
+
+        // Reference: dequantize the expert's rows and dot them with the raw activation. The
+        // kernel quantizes the activation to Q8_K, so the tolerance is a percent, not a bit.
+        let ids_v = ids.to_vec2::<u32>().unwrap();
+        let x_v = x.to_vec3::<f32>().unwrap();
+        for (t, row_ids) in ids_v.iter().enumerate() {
+            for (j, &ex) in row_ids.iter().enumerate() {
+                let ex = ex as usize;
+                let mut deq = vec![0f32; n * k];
+                iq4xs::dequantize_scalar(
+                    &packed[ex * n * row_bytes..(ex + 1) * n * row_bytes],
+                    &mut deq,
+                )
+                .unwrap();
+                for o in 0..n {
+                    let want: f32 = (0..k).map(|i| deq[o * k + i] * x_v[t][0][i]).sum();
+                    let g = got.i((t, j, o)).unwrap().to_scalar::<f32>().unwrap();
+                    assert!(
+                        (g - want).abs() <= 2e-2 * want.abs().max(1.0),
+                        "IQ4_XS slot ({t},{j}) row {o}: {g} vs {want}"
+                    );
                 }
             }
         }

@@ -186,8 +186,8 @@ pub use gguf::cpu::cpu_indexed_moe_forward;
 pub use gguf::cuda::{
     grouped_moe_gemm_prequantized, indexed_moe_fused_decode, moe_dispatch_build,
     moe_weighted_reduce_flat, moe_weighted_reduce_flat_bf16, moe_weighted_reduce_flat_same_dtype,
-    quantize_input_q8_1, IndexedMoeLoraDecode, IndexedMoeLoraWeights, IndexedMoeRouting,
-    ACT_GELU_PYTORCH_TANH, ACT_SILU,
+    quantize_input_q8_1, supports_moe_grouped, IndexedMoeLoraDecode, IndexedMoeLoraWeights,
+    IndexedMoeRouting, ACT_GELU_PYTORCH_TANH, ACT_SILU,
 };
 #[cfg(feature = "cuda")]
 #[doc(hidden)]
@@ -1313,7 +1313,7 @@ impl TryFrom<GgmlDType> for IsqType {
             GgmlDType::Q8_0 => Ok(Self::Q8_0),
             GgmlDType::Q8_1 => Ok(Self::Q8_1),
             GgmlDType::Q8K => Ok(Self::Q8K),
-            GgmlDType::BF16 | GgmlDType::F32 | GgmlDType::F16 => {
+            GgmlDType::BF16 | GgmlDType::F32 | GgmlDType::F16 | GgmlDType::IQ4XS => {
                 candle_core::bail!("Expected valid GGML ISQ type.")
             }
         }

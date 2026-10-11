@@ -189,6 +189,7 @@ fn indexed_moe_weight_dtype(dtype: GgmlDType) -> bool {
             | GgmlDType::Q4K
             | GgmlDType::Q5K
             | GgmlDType::Q6K
+            | GgmlDType::IQ4XS
     )
 }
 
@@ -485,6 +486,21 @@ fn indexed_moe_forward_fused_q8_1_input(
             }
             GgmlDType::Q8_0 => {
                 ffi::launch_indexed_moe_forward_q8_0_q8_1(
+                    weights_ptr,
+                    inputs_ptr as *const std::ffi::c_void,
+                    indices_ptr as *const u32,
+                    outputs_ptr as *mut f32,
+                    n_i32,
+                    k_i32,
+                    batch_i32,
+                    topk_i32,
+                    k_padded_i32,
+                    input_dim1_i32,
+                    stream,
+                );
+            }
+            GgmlDType::IQ4XS => {
+                ffi::launch_indexed_moe_forward_iq4xs_q8_1(
                     weights_ptr,
                     inputs_ptr as *const std::ffi::c_void,
                     indices_ptr as *const u32,
@@ -1356,6 +1372,27 @@ impl<'a> IndexedMoeLoraDecode<'a> {
     }
 }
 
+/// Whether the grouped MoE GEMM kernels (`grouped_moe_gemm_prequantized` and the
+/// MMQ pair path) serve `dtype`. Types outside this list (e.g. IQ4_XS) fall back
+/// to the per-token `indexed_moe_fused_decode` kernels.
+pub fn supports_moe_grouped(dtype: GgmlDType) -> bool {
+    matches!(
+        dtype,
+        GgmlDType::Q8_0
+            | GgmlDType::Q4_0
+            | GgmlDType::Q4_1
+            | GgmlDType::Q5_0
+            | GgmlDType::Q5_1
+            | GgmlDType::Q8_1
+            | GgmlDType::Q2K
+            | GgmlDType::Q3K
+            | GgmlDType::Q4K
+            | GgmlDType::Q5K
+            | GgmlDType::Q6K
+            | GgmlDType::IQ4XS
+    )
+}
+
 /// Run grouped MoE GEMM with pre-quantized Q8_1 input.
 ///
 /// Avoids re-quantizing the input when the same input is used for multiple projections.
@@ -1411,6 +1448,7 @@ pub fn grouped_moe_gemm_prequantized(
                 GgmlDType::Q4K => ffi::launch_moe_grouped_gemm_q4k,
                 GgmlDType::Q5K => ffi::launch_moe_grouped_gemm_q5k,
                 GgmlDType::Q6K => ffi::launch_moe_grouped_gemm_q6k,
+                GgmlDType::IQ4XS => ffi::launch_moe_grouped_gemm_iq4xs,
                 _ => candle_core::bail!("unsupported dtype: {dtype:?}"),
             };
 
@@ -1539,6 +1577,7 @@ pub unsafe fn indexed_moe_fused_decode(
             GgmlDType::Q4K => ffi::launch_moe_gemv_fused_gate_up_q4k_q8_1,
             GgmlDType::Q5K => ffi::launch_moe_gemv_fused_gate_up_q5k_q8_1,
             GgmlDType::Q6K => ffi::launch_moe_gemv_fused_gate_up_q6k_q8_1,
+            GgmlDType::IQ4XS => ffi::launch_moe_gemv_fused_gate_up_iq4xs_q8_1,
             _ => candle_core::bail!("unsupported dtype for fused MoE decode: {gate_up_dtype:?}"),
         };
 
@@ -1607,6 +1646,7 @@ pub unsafe fn indexed_moe_fused_decode(
             GgmlDType::Q4K => ffi::launch_moe_gemv_down_aggregate_q4k_q8_1,
             GgmlDType::Q5K => ffi::launch_moe_gemv_down_aggregate_q5k_q8_1,
             GgmlDType::Q6K => ffi::launch_moe_gemv_down_aggregate_q6k_q8_1,
+            GgmlDType::IQ4XS => ffi::launch_moe_gemv_down_aggregate_iq4xs_q8_1,
             _ => candle_core::bail!("unsupported dtype for fused MoE decode: {down_dtype:?}"),
         };
 

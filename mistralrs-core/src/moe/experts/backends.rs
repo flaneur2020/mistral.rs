@@ -1129,6 +1129,20 @@ impl FastExpertsWeights {
             })
     }
 
+    /// The grouped GEMM kernels only serve a fixed set of quant types; anything
+    /// else (for example IQ4_XS) uses the per-token fused decode kernels instead.
+    #[cfg(feature = "cuda")]
+    fn grouped_prefill_dtype_supported(&self) -> bool {
+        [
+            &self.fused_gate_proj,
+            &self.fused_up_proj,
+            &self.fused_down_proj,
+        ]
+        .iter()
+        .filter_map(|projection| projection.get_qtensor())
+        .all(|q| mistralrs_quant::supports_moe_grouped(q.dtype()))
+    }
+
     #[cfg(feature = "cuda")]
     pub(super) fn select_cuda_fast_path(forward: &MoEForward) -> Option<MoECudaFastPath> {
         if !forward.xs.device().is_cuda() {
@@ -1215,6 +1229,14 @@ impl FastExpertsWeights {
                     );
                 });
                 Some(MoECudaFastPath::GroupedPrefill)
+            }
+            path => path,
+        };
+        let path = match path {
+            Some(MoECudaFastPath::GroupedPrefill) if !self.grouped_prefill_dtype_supported() => {
+                // The grouped GEMM kernels do not serve this quant type (e.g. IQ4_XS);
+                // the per-token fused decode kernels do, at any batch size.
+                Some(MoECudaFastPath::Decode)
             }
             path => path,
         };

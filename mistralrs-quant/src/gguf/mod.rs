@@ -8,6 +8,7 @@ pub mod fast_mmq;
 pub mod fast_mmvq;
 #[cfg(feature = "cuda")]
 mod ffi;
+pub mod iq4xs;
 #[cfg(all(feature = "cuda", has_marlin_kernels))]
 mod packed_affine;
 mod weight_source;
@@ -67,6 +68,7 @@ fn ggml_dtype_to_uqff_code(dtype: GgmlDType) -> u32 {
         GgmlDType::Q5K => 13,
         GgmlDType::Q6K => 14,
         GgmlDType::Q8K => 15,
+        GgmlDType::IQ4XS => 23,
         GgmlDType::BF16 => 30,
     }
 }
@@ -87,6 +89,7 @@ fn ggml_dtype_from_uqff_code(dtype: u32) -> Result<GgmlDType> {
         13 => Ok(GgmlDType::Q5K),
         14 => Ok(GgmlDType::Q6K),
         15 => Ok(GgmlDType::Q8K),
+        23 => Ok(GgmlDType::IQ4XS),
         30 => Ok(GgmlDType::BF16),
         _ => candle_core::bail!("unknown dtype for quantized weight tensor {dtype}"),
     }
@@ -108,6 +111,7 @@ fn gguf_dtype_label(dtype: u32) -> String {
         13 => "q5k",
         14 => "q6k",
         15 => "q8k",
+        23 => "iq4xs",
         30 => "bf16",
         _ => "unknown",
     }
@@ -314,12 +318,37 @@ impl GgufMatMul {
             return Ok(Some(fast_mmvq::plain(q, a)?));
         }
 
-        // Batch > 8: use MMQ (prompt kernel)
+        // Batch > 8: use MMQ (prompt kernel). A type without an MMQ kernel
+        // (IQ4_XS) chunks through MMVQ instead, so prefill still runs on the GPU
+        // rather than falling back to a matmul candle cannot run.
         if flat_batch > fast_mmvq::MMVQ_MAX_BATCH {
-            return Ok(Some(fast_mmq::plain(q, a)?));
+            if fast_mmq::supports(q.dtype()) {
+                return Ok(Some(fast_mmq::plain(q, a)?));
+            }
+            return Ok(Some(Self::mmvq_chunked(q, a)?));
         }
 
         Ok(None)
+    }
+
+    /// MMVQ is a batched matvec, so it takes at most `MMVQ_MAX_BATCH` rows at a
+    /// time. Types with no MMQ prompt kernel (IQ4_XS) chunk through it instead.
+    #[cfg(feature = "cuda")]
+    fn mmvq_chunked(w: &QTensor, xs: &Tensor) -> Result<Tensor> {
+        let dims = xs.dims().to_vec();
+        let k = *dims.last().expect("input has at least one dimension");
+        let rows = dims[..dims.len() - 1].iter().product::<usize>();
+        let nrows = w.shape().dims2()?.0;
+        let flat = xs.reshape((rows, k))?;
+        let mut chunks = Vec::new();
+        for start in (0..rows).step_by(fast_mmvq::MMVQ_MAX_BATCH) {
+            let len = fast_mmvq::MMVQ_MAX_BATCH.min(rows - start);
+            chunks.push(fast_mmvq::plain(w, &flat.narrow(0, start, len)?)?);
+        }
+        let out = Tensor::cat(&chunks, 0)?;
+        let mut out_dims = dims[..dims.len() - 1].to_vec();
+        out_dims.push(nrows);
+        out.reshape(out_dims)
     }
 
     #[cfg(all(feature = "cuda", has_marlin_kernels))]
