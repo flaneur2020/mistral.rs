@@ -2,6 +2,9 @@ pub mod archive;
 pub mod cpu;
 #[cfg(feature = "cuda")]
 pub(crate) mod cuda;
+/// Only the CUDA quantized-embedding fallback uses this.
+#[cfg(feature = "cuda")]
+pub mod dequant;
 #[cfg(feature = "cuda")]
 pub mod fast_mmq;
 #[cfg(feature = "cuda")]
@@ -51,6 +54,8 @@ pub struct GgufMatMul {
     pub(crate) w: QMatMul,
     pub(crate) b: Option<Tensor>,
     stats: crate::ImatrixLayerStats,
+    #[cfg(feature = "cuda")]
+    iq_host_weights: OnceLock<Option<Vec<u8>>>,
     #[cfg(all(feature = "cuda", has_marlin_kernels))]
     packed_affine: OnceLock<Option<Arc<packed_affine::PackedAffine>>>,
     #[cfg(all(feature = "cuda", has_marlin_kernels))]
@@ -146,11 +151,79 @@ impl GgufMatMul {
             w,
             b,
             stats,
+            #[cfg(feature = "cuda")]
+            iq_host_weights: OnceLock::new(),
             #[cfg(all(feature = "cuda", has_marlin_kernels))]
             packed_affine: OnceLock::new(),
             #[cfg(all(feature = "cuda", has_marlin_kernels))]
             _gguf_affine_reservation: reservation,
         }
+    }
+
+    /// candle has no CUDA `get_rows`/`dequantize` for this crate's IQ formats
+    /// (the block types live here, not there), so a quantized token embedding
+    /// cannot be gathered on the GPU. Embeddings are small, so keep the packed
+    /// bytes in host memory, dequantize only the requested rows with this crate's
+    /// CPU kernels and copy the (small) result back.
+    #[cfg(feature = "cuda")]
+    fn iq_cuda_embedding(&self, ids: &Tensor) -> Result<Option<Tensor>> {
+        let QMatMul::QTensor(weight) = &self.w else {
+            return Ok(None);
+        };
+        let dtype = weight.dtype();
+        if !weight.device().is_cuda() || !dequant::is_fork_iq(dtype) {
+            return Ok(None);
+        }
+        let raw = self.iq_host_weights.get_or_init(|| match weight.data() {
+            Ok(data) => Some(data.into_owned()),
+            Err(error) => {
+                tracing::warn!(
+                    "could not read a {dtype:?} weight for a CUDA embedding lookup: {error}"
+                );
+                None
+            }
+        });
+        let Some(raw) = raw.as_ref() else {
+            return Ok(None);
+        };
+
+        let (rows, cols) = weight.shape().dims2()?;
+        let row_bytes = (cols / dtype.block_size()) * dtype.type_size();
+        if raw.len() < rows * row_bytes {
+            candle_core::bail!(
+                "CUDA embedding fallback: {rows}x{cols} {dtype:?} needs {} host bytes, got {}",
+                rows * row_bytes,
+                raw.len()
+            );
+        }
+
+        let mut out_shape = ids.dims().to_vec();
+        out_shape.push(cols);
+        let ids = ids
+            .to_device(&candle_core::Device::Cpu)?
+            .to_dtype(candle_core::DType::U32)?
+            .flatten_all()?
+            .contiguous()?;
+        let ids = ids.to_vec1::<u32>()?;
+
+        let mut out = vec![0f32; ids.len() * cols];
+        for (i, &id) in ids.iter().enumerate() {
+            let id = id as usize;
+            if id >= rows {
+                candle_core::bail!(
+                    "CUDA embedding fallback: id {id} is out of range for {rows} rows"
+                );
+            }
+            dequant::dequantize(
+                &raw[id * row_bytes..(id + 1) * row_bytes],
+                dtype,
+                &mut out[i * cols..(i + 1) * cols],
+            )?;
+        }
+        Ok(Some(
+            Tensor::from_vec(out, out_shape, &candle_core::Device::Cpu)?
+                .to_device(&weight.device())?,
+        ))
     }
 
     fn qtensor_to_device(q: &Arc<QTensor>, device: &Device) -> Result<Arc<QTensor>> {
@@ -483,6 +556,10 @@ impl QuantMethod for GgufMatMul {
     }
 
     fn embedding_forward_raw(&self, ids: &Tensor) -> Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        if let Some(out) = self.iq_cuda_embedding(ids)? {
+            return Ok(out);
+        }
         self.w.embedding(ids)
     }
 

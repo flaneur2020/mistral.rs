@@ -73,10 +73,13 @@ NVFP4 (40). Each is the same shape of work as below.
    `from_u32`/`to_u32`, `block_size`, `type_size`) and the stub arms in
    `cpu_zeros`, `from_data`, `QStorage::from_data` (Metal + CUDA) and
    `QCudaStorage::dequantize` (the block type lives here, not in candle). ~20 lines.
-4. **Fork wiring** — `archive.rs` (`candle_dtype`, `ggml_dtype_alignment`,
+4. **Fork wiring** — `archive.rs` (`candle_dtype`, **plus the `GgufDType`
+   `name`/`block_size`/`type_size` tables** -- miss those and loading dies with
+   "cannot determine the exact byte length", `ggml_dtype_alignment`,
    `storage_for_device` dispatch), `cpu.rs` (`routed_gemv` arm), `gguf/mod.rs`
    (`mod`, uqff code/label), `lib.rs` (`TryFrom<GgmlDType> for IsqType` bail arm),
-   `packed_affine.rs` (return `None`).
+   `packed_affine.rs` (return `None`). The regression test
+   `archive::tests::supported_gguf_dtypes_have_a_size_and_name` covers the tables.
 5. **CUDA MMVQ/MoE** — `indexed_moe.cu` (block, `vec_dot`, indexed + fused
    gate/up + down/aggregate + launchers), `mmvq_gguf.cu` (block, `vec_dot` with
    `kbx`, plain/glu/qkv batch sets + launchers), `moe_grouped.cu` (block, `vd_`
@@ -97,6 +100,14 @@ NVFP4 (40). Each is the same shape of work as below.
    prefill, dense MMQ, grouped MMQ.
 
 ## Notes
+
+- candle has no CUDA `get_rows`/`dequantize` for these formats -- the block types
+  live here, so its quantized-embedding kernel cannot serve them. Matmuls never
+  need it, but a quantized *token embedding* does. `GgufMatMul` therefore keeps
+  the packed bytes in host memory and dequantizes only the requested rows with
+  its (ggml-exact) CPU kernels, copying the small result to the device. Building
+  a dense copy on the GPU instead is not an option: the 248k x 2560 f32 embedding
+  is ~2.5 GB and does not fit alongside the model.
 
 - A `block_iq4_nl`'s `qs` sits at byte offset 2, so the CUDA code must use the
   2-byte-safe `get_int_from_uint8`, not the 4-byte `..._aligned` variant (the
