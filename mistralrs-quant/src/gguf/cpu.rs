@@ -477,21 +477,29 @@ mod throughput_bench {
     #[ignore = "throughput microbenchmark"]
     fn bench_vec_dot_throughput() {
         println!("rayon threads: {}", rayon::current_num_threads());
-        println!("--- gate/up (n=640, k=2560), 10 experts/token ---");
-        let (n, k, e) = (640usize, 2560usize, 10usize);
-        run::<BlockIQ2S>("IQ2_S", n, k, e, 20);
-        run::<BlockIQ3XXS>("IQ3_XXS", n, k, e, 20);
-        run::<BlockIQ3S>("IQ3_S", n, k, e, 20);
-        run::<BlockIQ4NL>("IQ4_NL", n, k, e, 20);
-        run::<BlockIQ4XS>("IQ4_XS", n, k, e, 20);
+        // Working-set sweep: 10 experts (~19 MB) fits in the 32 MB L3 of a 3600X and
+        // measures the kernel ceiling; 128 (~240 MB) forces DRAM and shows how much
+        // the single memory channel costs each type.
+        let e: usize = std::env::var("EXPERTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+        let iters = (200 / e).max(2);
+        println!("--- gate/up (n=640, k=2560), {e} experts/token, {iters} iters ---");
+        let (n, k) = (640usize, 2560usize);
+        run::<BlockIQ2S>("IQ2_S", n, k, e, iters);
+        run::<BlockIQ3XXS>("IQ3_XXS", n, k, e, iters);
+        run::<BlockIQ3S>("IQ3_S", n, k, e, iters);
+        run::<BlockIQ4NL>("IQ4_NL", n, k, e, iters);
+        run::<BlockIQ4XS>("IQ4_XS", n, k, e, iters);
         println!("--- candle K-quants (requant baseline) ---");
-        run::<BlockQ2K>("Q2_K", n, k, e, 20);
-        run::<BlockQ3K>("Q3_K", n, k, e, 20);
-        run::<BlockQ4K>("Q4_K", n, k, e, 20);
-        println!("--- down (n=2560, k=640), 10 experts/token ---");
+        run::<BlockQ2K>("Q2_K", n, k, e, iters);
+        run::<BlockQ3K>("Q3_K", n, k, e, iters);
+        run::<BlockQ4K>("Q4_K", n, k, e, iters);
+        println!("--- down (n=2560, k=640), {e} experts/token ---");
         let (n, k) = (2560usize, 640usize);
-        run::<BlockQ2_0>("Q2_0", n, k, e, 20);
-        run::<BlockIQ4NL>("IQ4_NL", n, k, e, 20);
-        run::<BlockQ4_0>("Q4_0", n, k, e, 20);
+        run::<BlockQ2_0>("Q2_0", n, k, e, iters);
+        run::<BlockIQ4NL>("IQ4_NL", n, k, e, iters);
+        run::<BlockQ4_0>("Q4_0", n, k, e, iters);
     }
 }
