@@ -54,6 +54,7 @@ enum ggml_type {
     GGML_TYPE_BF16    = 30,
     GGML_TYPE_MXFP4   = 39,
     GGML_TYPE_NVFP4   = 40,
+    GGML_TYPE_Q2_0    = 42,
 };
 
 // ============================================================
@@ -95,6 +96,10 @@ enum ggml_type {
 #define QK8_1 32
 #define QR8_1 1
 #define QI8_1 (QK8_1 / (4 * QR8_1))
+
+#define QK2_0 64
+#define QR2_0 1
+#define QI2_0 (QK2_0 / 32)
 
 #define QR2_K 4
 #define QI2_K (QK_K / (4 * QR2_K))
@@ -146,6 +151,7 @@ typedef struct { half d; uint8_t qh[4]; uint8_t qs[QK5_0 / 2]; } block_q5_0;
 typedef struct { half2 dm; uint8_t qh[4]; uint8_t qs[QK5_1 / 2]; } block_q5_1;
 typedef struct { half d; int8_t qs[QK8_0]; } block_q8_0;
 typedef struct { half2 ds; int8_t qs[QK8_1]; } block_q8_1;
+typedef struct { half d; uint8_t qs[QK2_0 / 4]; } block_q2_0;
 
 typedef struct {
     uint8_t scales[QK_K/16];
@@ -456,6 +462,7 @@ template<> struct ggml_cuda_type_traits<GGML_TYPE_Q4_1>    { static constexpr in
 template<> struct ggml_cuda_type_traits<GGML_TYPE_Q5_0>    { static constexpr int qk = QK5_0;  static constexpr int qr = QR5_0;  static constexpr int qi = QI5_0; };
 template<> struct ggml_cuda_type_traits<GGML_TYPE_Q5_1>    { static constexpr int qk = QK5_1;  static constexpr int qr = QR5_1;  static constexpr int qi = QI5_1; };
 template<> struct ggml_cuda_type_traits<GGML_TYPE_Q8_0>    { static constexpr int qk = QK8_0;  static constexpr int qr = QR8_0;  static constexpr int qi = QI8_0; };
+template<> struct ggml_cuda_type_traits<GGML_TYPE_Q2_0>    { static constexpr int qk = QK2_0;  static constexpr int qr = QR2_0;  static constexpr int qi = QI2_0; };
 template<> struct ggml_cuda_type_traits<GGML_TYPE_Q2_K>    { static constexpr int qk = QK_K;   static constexpr int qr = QR2_K;  static constexpr int qi = QI2_K; };
 template<> struct ggml_cuda_type_traits<GGML_TYPE_Q3_K>    { static constexpr int qk = QK_K;   static constexpr int qr = QR3_K;  static constexpr int qi = QI3_K; };
 template<> struct ggml_cuda_type_traits<GGML_TYPE_Q4_K>    { static constexpr int qk = QK_K;   static constexpr int qr = QR4_K;  static constexpr int qi = QI4_K; };
@@ -535,16 +542,16 @@ static __device__ __forceinline__ float ggml_cuda_ue4m3_to_fp32(uint8_t x) {
     return static_cast<float>(raw / 2);
 }
 
-// IQ/MXFP4 lookup table stubs (needed for compilation even though we only instantiate standard quant types)
-// These are device constants from ggml-common.h. We provide minimal stubs.
-// The functions referencing them are only called for IQ/MXFP4 types which we never instantiate.
+// IQ/MXFP4 lookup tables from ggml-common.h. The IQ2_S/IQ3_XXS/IQ3_S codebooks are
+// real (shared with the MoE kernels); the remaining ones are stubs for types we do
+// not instantiate.
 static const __device__ int8_t  kvalues_mxfp4[16] = {0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15};
 static const __device__ int8_t  kvalues_iq4nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
 static const __device__ uint64_t iq2xxs_grid[256] = {0};
 static const __device__ uint64_t iq2xs_grid[512] = {0};
-static const __device__ uint64_t iq2s_grid[1024] = {0};
-static const __device__ uint32_t iq3xxs_grid[256] = {0};
-static const __device__ uint32_t iq3s_grid[512] = {0};
+#include "../iq2s_grid.cuh"
+#include "../iq3xxs_grid.cuh"
+#include "../iq3s_grid.cuh"
 static const __device__ uint32_t iq1s_grid_gpu[512] = {0};
 #define IQ1S_DELTA 0.125f
 #define IQ1M_DELTA 0.125f

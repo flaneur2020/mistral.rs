@@ -65,6 +65,10 @@ pub fn supports(dtype: GgmlDType) -> bool {
             | GgmlDType::Q6K
             | GgmlDType::IQ4XS
             | GgmlDType::IQ4NL
+            | GgmlDType::IQ3_XXS
+            | GgmlDType::IQ2_S
+            | GgmlDType::IQ3_S
+            | GgmlDType::Q2_0
     )
 }
 
@@ -75,8 +79,9 @@ fn qk_for(dtype: GgmlDType) -> usize {
             32
         }
         GgmlDType::Q2K | GgmlDType::Q3K | GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q6K => 256,
-        GgmlDType::IQ4XS => 256,
+        GgmlDType::IQ4XS | GgmlDType::IQ3_XXS | GgmlDType::IQ2_S | GgmlDType::IQ3_S => 256,
         GgmlDType::IQ4NL => 32,
+        GgmlDType::Q2_0 => 64,
         _ => unreachable!(),
     }
 }
@@ -99,8 +104,12 @@ fn ds_layout_for(dtype: GgmlDType) -> DsLayout {
         GgmlDType::Q3K => DsLayout::D4,
         GgmlDType::Q4K | GgmlDType::Q5K => DsLayout::DS4,
         GgmlDType::Q6K => DsLayout::D4,
-        GgmlDType::IQ4XS => DsLayout::D4,
-        GgmlDType::IQ4NL => DsLayout::D4,
+        GgmlDType::IQ4XS
+        | GgmlDType::IQ4NL
+        | GgmlDType::IQ3_XXS
+        | GgmlDType::IQ2_S
+        | GgmlDType::IQ3_S
+        | GgmlDType::Q2_0 => DsLayout::D4,
         _ => unreachable!(),
     }
 }
@@ -225,6 +234,10 @@ fn mmq_launcher(dtype: GgmlDType) -> Option<MmqLauncher> {
         GgmlDType::Q6K => ffi::launch_mmq_gguf_q6_k,
         GgmlDType::IQ4XS => ffi::launch_mmq_gguf_iq4_xs,
         GgmlDType::IQ4NL => ffi::launch_mmq_gguf_iq4_nl,
+        GgmlDType::IQ3_XXS => ffi::launch_mmq_gguf_iq3_xxs,
+        GgmlDType::IQ2_S => ffi::launch_mmq_gguf_iq2_s,
+        GgmlDType::IQ3_S => ffi::launch_mmq_gguf_iq3_s,
+        GgmlDType::Q2_0 => ffi::launch_mmq_gguf_q2_0,
         _ => return None,
     };
     Some(f)
@@ -244,6 +257,10 @@ fn mmq_moe_launcher(dtype: GgmlDType) -> Option<MmqMoeLauncher> {
         GgmlDType::Q6K => ffi::launch_mmq_gguf_q6_k_moe,
         GgmlDType::IQ4XS => ffi::launch_mmq_gguf_iq4_xs_moe,
         GgmlDType::IQ4NL => ffi::launch_mmq_gguf_iq4_nl_moe,
+        GgmlDType::IQ3_XXS => ffi::launch_mmq_gguf_iq3_xxs_moe,
+        GgmlDType::IQ2_S => ffi::launch_mmq_gguf_iq2_s_moe,
+        GgmlDType::IQ3_S => ffi::launch_mmq_gguf_iq3_s_moe,
+        GgmlDType::Q2_0 => ffi::launch_mmq_gguf_q2_0_moe,
         _ => return None,
     };
     Some(f)

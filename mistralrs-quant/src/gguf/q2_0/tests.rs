@@ -681,3 +681,136 @@ fn cuda_grouped_moe_gemm_matches_the_cpu_kernel() {
         );
     }
 }
+
+/// The dense prompt kernel (`fast_mmq`, chosen for a batch over 8) must serve
+/// Q2_0 too.
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_mmq_matches_the_cpu_kernel() {
+    use candle_core::{DType, Device, Tensor};
+
+    let (n, k, batch) = (32, 256, 16);
+    let row_bytes = (k / QK2_0) * BLOCK_BYTES;
+    let w: Vec<f32> = (0..n * k)
+        .map(|i| ((i as f32) * 0.31).sin().abs() * 0.5 + 0.1)
+        .collect();
+    let mut packed = vec![0u8; n * row_bytes];
+    for row in 0..n {
+        quantize_q2_0(
+            &w[row * k..(row + 1) * k],
+            &mut packed[row * row_bytes..(row + 1) * row_bytes],
+        )
+        .unwrap();
+    }
+    let x: Vec<f32> = (0..batch * k)
+        .map(|i| ((i as f32) * 0.07).cos().abs() + 0.5)
+        .collect();
+    let mut want = vec![0f32; batch * n];
+    for t in 0..batch {
+        gemv(
+            &packed,
+            &x[t * k..(t + 1) * k],
+            &mut want[t * n..(t + 1) * n],
+        )
+        .unwrap();
+    }
+    let dev = Device::new_cuda(0).unwrap();
+    let qt =
+        crate::gguf::archive::qtensor_from_gguf_data(GgmlDType::Q2_0, &packed, vec![n, k], &dev)
+            .unwrap();
+    let xd = Tensor::from_vec(x, (batch, k), &dev).unwrap();
+    let got = crate::gguf::fast_mmq::plain(&qt, &xd)
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    assert_eq!(got.len(), batch * n);
+    for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+        assert!(
+            (g - w).abs() <= 3e-2 * w.abs().max(1.0),
+            "mmq element {i}: {g} vs {w}"
+        );
+    }
+}
+
+/// The MoE prefill MMQ path (`fast_mmq::grouped`) must serve Q2_0 too.
+///
+/// Like `mistralrs-core`, the input is one row per expert assignment and
+/// `ids_src`/`ids_dst` are the dispatch's `sorted_token_ids`.
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_grouped_mmq_matches_the_cpu_kernel() {
+    use candle_core::{DType, Device, Storage, Tensor};
+    let (e, n, k) = (4usize, 32usize, 256usize);
+    let (tokens, topk) = (6usize, 2usize);
+    let total = tokens * topk;
+    let packed = pack_rows(|i| ((i as f32) * 0.23).sin().abs() * 0.5 + 0.1, e * n, k);
+    let x_tok: Vec<f32> = (0..tokens * k)
+        .map(|i| ((i as f32) * 0.07).cos().abs() + 0.5)
+        .collect();
+    let mut x = vec![0f32; total * k];
+    for a in 0..total {
+        let t = a / topk;
+        x[a * k..(a + 1) * k].copy_from_slice(&x_tok[t * k..(t + 1) * k]);
+    }
+    let ids_data: [[u32; 2]; 6] = [[0, 2], [1, 3], [2, 0], [3, 1], [0, 3], [2, 2]];
+    let dev = Device::new_cuda(0).unwrap();
+    let cuda = dev.as_cuda_device().unwrap();
+    let qt =
+        crate::gguf::archive::qtensor_from_gguf_data(GgmlDType::Q2_0, &packed, vec![e, n, k], &dev)
+            .unwrap();
+    let xd = Tensor::from_vec(x, (total, k), &dev).unwrap();
+    let ids = Tensor::new(&ids_data, &dev)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_dtype(DType::U32)
+        .unwrap();
+    let (ids_storage, _) = ids.storage_and_layout();
+    let Storage::Cuda(ids_cuda) = &*ids_storage else {
+        panic!("ids must be on CUDA")
+    };
+    let ids_slice = ids_cuda.as_cuda_slice::<u32>().unwrap();
+    let (bounds, sorted_ids, _) =
+        crate::gguf::cuda::moe_dispatch_build(ids_slice, total, e, topk, cuda).unwrap();
+    let out = crate::gguf::fast_mmq::grouped(
+        &qt,
+        &xd,
+        &sorted_ids,
+        &sorted_ids,
+        &bounds,
+        total,
+        total,
+        e,
+        cuda,
+    )
+    .unwrap()
+    .to_dtype(DType::F32)
+    .unwrap()
+    .flatten_all()
+    .unwrap()
+    .to_vec1::<f32>()
+    .unwrap();
+    let row_bytes = (k / QK2_0) * BLOCK_BYTES;
+    let mut want = vec![0f32; total * n];
+    for a in 0..total {
+        let t = a / topk;
+        let expert = ids_data[t][a % topk] as usize;
+        gemv(
+            &packed[expert * n * row_bytes..(expert + 1) * n * row_bytes],
+            &x_tok[t * k..(t + 1) * k],
+            &mut want[a * n..(a + 1) * n],
+        )
+        .unwrap();
+    }
+    assert_eq!(out.len(), total * n);
+    for (i, (g, w)) in out.iter().zip(&want).enumerate() {
+        assert!(
+            (g - w).abs() <= 5e-2 * w.abs().max(1.0),
+            "grouped mmq element {i}: {g} vs {w}"
+        );
+    }
+}
