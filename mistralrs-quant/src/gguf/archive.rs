@@ -113,6 +113,7 @@ impl GgufDType {
             39 => "MXFP4",
             40 => "NVFP4",
             41 => "Q1_0",
+            42 => "Q2_0",
             _ => "UNKNOWN",
         }
     }
@@ -123,6 +124,7 @@ impl GgufDType {
             2 | 3 | 6..=9 | 20 | 39 => Some(32),
             40 => Some(64),
             41 => Some(128),
+            42 => Some(64),
             10..=19 | 21..=23 | 29 | 34 | 35 => Some(256),
             _ => None,
         }
@@ -162,6 +164,7 @@ impl GgufDType {
             39 => Some(17),
             40 => Some(36),
             41 => Some(18),
+            42 => Some(18),
             _ => None,
         }
     }
@@ -1347,6 +1350,28 @@ mod tests {
     use tempfile::NamedTempFile;
 
     use super::*;
+
+    /// Every dtype `candle_dtype` accepts must also have a block size, a type size
+    /// and a name: `tensor_byte_len` returns `None` without the first two, which
+    /// aborts the load with "cannot determine the exact byte length".
+    #[test]
+    fn supported_gguf_dtypes_have_a_size_and_name() {
+        for raw in [
+            0u32, 1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 18, 20, 21, 22, 23, 30, 42,
+        ] {
+            let dtype = GgufDType::new(raw);
+            assert!(
+                dtype.candle_dtype().is_ok(),
+                "dtype {raw} should map to a Candle dtype"
+            );
+            assert!(
+                dtype.block_size().is_some(),
+                "dtype {raw} has no block size"
+            );
+            assert!(dtype.type_size().is_some(), "dtype {raw} has no type size");
+            assert_ne!(dtype.name(), "UNKNOWN", "dtype {raw} has no name");
+        }
+    }
 
     struct TestTensor {
         name: &'static str,
