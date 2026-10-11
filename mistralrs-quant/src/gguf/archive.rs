@@ -22,6 +22,7 @@ use candle_core::{
 use half::{bf16, f16};
 use memmap2::{Mmap, MmapOptions};
 
+use super::iq2s::{self, BlockIQ2S};
 use super::iq3xxs::{self, BlockIQ3XXS};
 use super::iq4nl::{self, BlockIQ4NL};
 use super::iq4xs::{self, BlockIQ4XS};
@@ -182,6 +183,7 @@ impl GgufDType {
             15 => GgmlDType::Q8K,
             18 => GgmlDType::IQ3_XXS,
             20 => GgmlDType::IQ4NL,
+            22 => GgmlDType::IQ2_S,
             23 => GgmlDType::IQ4XS,
             42 => GgmlDType::Q2_0,
             30 => GgmlDType::BF16,
@@ -610,11 +612,16 @@ pub(super) fn qtensor_from_gguf_data(
     }
     let storage = if matches!(
         dtype,
-        GgmlDType::IQ3_XXS | GgmlDType::IQ4XS | GgmlDType::IQ4NL | GgmlDType::Q2_0
+        GgmlDType::IQ2_S
+            | GgmlDType::IQ3_XXS
+            | GgmlDType::IQ4XS
+            | GgmlDType::IQ4NL
+            | GgmlDType::Q2_0
     ) {
         // candle-core has no block type for these, so its own storage is a stub;
         // build the storage in the type's own module instead.
         match dtype {
+            GgmlDType::IQ2_S => iq2s::storage_for_device(data, device)?,
             GgmlDType::IQ3_XXS => iq3xxs::storage_for_device(data, device)?,
             GgmlDType::IQ4XS => iq4xs::storage_for_device(data, device)?,
             GgmlDType::IQ4NL => iq4nl::storage_for_device(data, device)?,
@@ -652,6 +659,7 @@ const fn ggml_dtype_alignment(dtype: GgmlDType) -> usize {
         GgmlDType::IQ4NL => align_of::<BlockIQ4NL>(),
         GgmlDType::Q2_0 => align_of::<BlockQ2_0>(),
         GgmlDType::IQ3_XXS => align_of::<BlockIQ3XXS>(),
+        GgmlDType::IQ2_S => align_of::<BlockIQ2S>(),
         GgmlDType::BF16 => align_of::<bf16>(),
     }
 }

@@ -15,15 +15,16 @@ the `GgmlDType` variant (see below); the loader builds the storage with
 | IQ4_NL | 20 | 32 el / 18 B | Q8_0 | scalar + AVX2 | `indexed_moe`, `mmvq_gguf`, `moe_grouped`, `mmq_gguf` |
 | Q2_0 | 42 | 64 el / 18 B | Q8_0 (2 per block) | scalar | `indexed_moe`, `mmvq_gguf`, `moe_grouped` |
 | IQ3_XXS | 18 | 256 el / 98 B | Q8_K | scalar | `indexed_moe`, `mmvq_gguf`, `moe_grouped` |
+| IQ2_S | 22 | 256 el / 82 B | Q8_K | scalar | `indexed_moe`, `mmvq_gguf`, `moe_grouped` |
 
 Each has: an oracle generated from ggml (`tools/iq4xs`, `tools/iq4nl`,
-`tools/q2_0`, `tools/iq3xxs`), CPU oracle tests, and CUDA tests that compare
-every kernel against the CPU kernel. Q2_0 has no MMQ kernel (dense batches over
-8 chunk through MMVQ) and no SIMD dot (ggml has none either); IQ3_XXS has no MMQ
-kernel either (the fork's `mmq_common.cuh` ships a zeroed grid stub). IQ3_XXS's
-*quantizer* is a plain grid search, not ggml's map/neighbour search, so only its
-round-trip is tested -- the read path (dequantize + vec-dot) is checked against
-ggml.
+`tools/q2_0`, `tools/iq3xxs`, `tools/iq2s`), CPU oracle tests, and CUDA tests
+that compare every kernel against the CPU kernel. Q2_0/IQ3_XXS/IQ2_S have no
+MMQ kernel (dense batches over 8 chunk through MMVQ). Q2_0 has no SIMD dot
+either (ggml has none); IQ3_XXS/IQ2_S leave the fork's `mmq_common.cuh` grid
+stubs unused. The IQ3_XXS and IQ2_S *quantizers* are plain grid searches, not
+ggml's map/neighbour search, so only their round-trip is tested -- the read path
+(dequantize + vec-dot) is checked against ggml.
 
 ## Remaining for the Coder GGUF
 
@@ -31,8 +32,7 @@ From a census of shard 1 (1223 tensors); the routed experts use a mix:
 
 | Format | GGML id | Tensors (shard 1) | Priority |
 | --- | ---: | ---: | --- |
-| IQ2_S | 22 | 40 exps | next (most experts); `iq2s_grid[1024]` |
-| IQ3_S | 21 | 20 exps | `iq3s_grid[512]` + separate signs |
+| IQ3_S | 21 | 20 exps | last; `iq3s_grid[512]` + separate signs |
 
 The PLE n-gram table is IQ4_NL and is read directly by the fork, so it needs no
 candle support.
@@ -82,9 +82,11 @@ NVFP4 (40). Each is the same shape of work as below.
   offset 8 and is fine either way; `block_q2_0::qs` is read byte-wise.
 - Q2_0 has no MMQ path in the fork's `mmq_gguf` headers, so `fast_mmq` must not
   claim it (`supports(Q2_0)` stays false); the dense prompt path uses
-  `GgufMatMul::mmvq_chunked`. The same holds for IQ3_XXS: `mmq_common.cuh`
-  stubs `iq3xxs_grid` (and the other iq grids) to zero, so add the real table
-  plus a `mmq_instance_iq3_xxs.cu` before claiming it.
+  `GgufMatMul::mmvq_chunked`. The same holds for IQ3_XXS and IQ2_S:
+  `mmq_common.cuh` stubs `iq3xxs_grid`/`iq2s_grid` (and the other iq grids) to
+  zero, so add the real table plus a `mmq_instance_iq*.cu` before claiming them.
+  IQ2_S's 1024-entry `u64` grid is shared by the three MoE `.cu` files through
+  `kernels/iq2s_grid.cuh` (too large to inline three times).
 - `supports_mmq(dtype)` being true makes the MoE prefill use the MMQ pair path;
   `grouped_moe_gemm_prequantized` (`moe_grouped.cu`) is the fallback and is also
   wired and tested.

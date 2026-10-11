@@ -5,6 +5,8 @@
 #include "cuda_fp16.h"
 #include <stdint.h>
 
+#include "../iq2s_grid.cuh"
+
 // Constants, types, and helpers shared with the indexed MoE kernels.
 
 #define WARP_SIZE 32
@@ -244,6 +246,15 @@ typedef struct {
   uint8_t qs[3 * QK_K / 8];
 } block_iq3_xxs;
 
+// IQ2_S (GGML type 22).
+typedef struct {
+  half d;
+  uint8_t qs[QK_K / 4];
+  uint8_t qh[QK_K / 32];
+  uint8_t scales[QK_K / 32];
+} block_iq2_s;
+
+
 
 #define QK4_0 32
 #define QR4_0 2
@@ -296,6 +307,8 @@ typedef struct {
 #define VDR_Q2_0_Q8_1_MMVQ 1
 #define QI3_XXS 16
 #define VDR_IQ3_XXS_Q8_1_MMVQ 2
+#define QI2_S 16
+#define VDR_IQ2_S_Q8_1_MMVQ 2
 
 // ---------------------------------------------------------------------------
 // vec_dot impl helpers (per-quant-type)
@@ -823,6 +836,49 @@ vec_dot_iq3_xxs_q8_1(const void *__restrict__ vbq,
   const int ls = aux32 >> 28;
   sumi = (ls * sumi + sumi / 2) / 2;
   const float d = __half2float(bq3->d) * __low2float(bq8_1[iqs / 2].ds);
+  return d * sumi;
+}
+
+// IQ2_S: one 32-element group per call (`iqs` is even, 0..14).
+static __device__ __forceinline__ float
+vec_dot_iq2_s_q8_1(const void *__restrict__ vbq,
+                   const block_q8_1 *__restrict__ bq8_1, const int &kbx,
+                   const int &iqs) {
+  const block_iq2_s *bq2 =
+      (const block_iq2_s *)vbq + kbx;
+  const int qs_packed = iq3_get_int_b2(bq2->qs, iqs / 2);
+  const uint8_t *qs = (const uint8_t *)&qs_packed;
+  const int qh = bq2->qh[iqs / 2];
+  const int signs_packed_32 = iq3_get_int_b2(bq2->qs, QK_K / 32 + iqs / 2);
+  const uint8_t *signs_packed_8 = (const uint8_t *)&signs_packed_32;
+  const int ls0 = bq2->scales[iqs / 2] & 0x0F;
+  const int ls1 = bq2->scales[iqs / 2] >> 4;
+  int sumi0 = 0;
+  int sumi1 = 0;
+#pragma unroll
+  for (int l0 = 0; l0 < 8; l0 += 2) {
+    const int *grid_pos =
+        (const int *)(iq2s_grid + (qs[l0 / 2] | ((qh << (8 - l0)) & 0x300)));
+    const int signs0 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x03) << 7) |
+                                     ((signs_packed_8[l0 / 2] & 0x0C) << 21),
+                                 0x00000000);
+    const int signs1 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x30) << 3) |
+                                     ((signs_packed_8[l0 / 2] & 0xC0) << 17),
+                                 0x00000000);
+    const int grid_l = __vsub4(grid_pos[0] ^ signs0, signs0);
+    const int grid_h = __vsub4(grid_pos[1] ^ signs1, signs1);
+    const int u0 = get_int_from_int8_aligned(bq8_1[iqs / 2].qs, l0 + 0);
+    const int u1 = get_int_from_int8_aligned(bq8_1[iqs / 2].qs, l0 + 1);
+    if (l0 < 4) {
+      sumi0 = ggml_cuda_dp4a(grid_l, u0, sumi0);
+      sumi0 = ggml_cuda_dp4a(grid_h, u1, sumi0);
+    } else {
+      sumi1 = ggml_cuda_dp4a(grid_l, u0, sumi1);
+      sumi1 = ggml_cuda_dp4a(grid_h, u1, sumi1);
+    }
+  }
+  const int sumi = (sumi0 * ls0 + sumi1 * ls1 + (sumi0 + sumi1) / 2) / 4;
+  const float d = __half2float(bq2->d) * __low2float(bq8_1[iqs / 2].ds);
   return d * sumi;
 }
 
@@ -1371,6 +1427,8 @@ MMVQ_PLAIN_BATCH_SET(q2_0, block_q2_0, QK2_0, 2, VDR_Q2_0_Q8_1_MMVQ,
                      vec_dot_q2_0_q8_1)
 MMVQ_PLAIN_BATCH_SET(iq3xxs, block_iq3_xxs, QK_K, QI3_XXS, VDR_IQ3_XXS_Q8_1_MMVQ,
                      vec_dot_iq3_xxs_q8_1)
+MMVQ_PLAIN_BATCH_SET(iq2s, block_iq2_s, QK_K, QI2_S, VDR_IQ2_S_Q8_1_MMVQ,
+                     vec_dot_iq2_s_q8_1)
 
 #define MMVQ_FUSED_GLU_TYPE_SET(tag, block_q_t, qk_val, qi_val, vdr_val,       \
                                 vec_dot)                                       \
@@ -1409,6 +1467,8 @@ MMVQ_FUSED_GLU_TYPE_SET(q2_0, block_q2_0, QK2_0, 2,
                         VDR_Q2_0_Q8_1_MMVQ, vec_dot_q2_0_q8_1)
 MMVQ_FUSED_GLU_TYPE_SET(iq3xxs, block_iq3_xxs, QK_K, QI3_XXS,
                         VDR_IQ3_XXS_Q8_1_MMVQ, vec_dot_iq3_xxs_q8_1)
+MMVQ_FUSED_GLU_TYPE_SET(iq2s, block_iq2_s, QK_K, QI2_S,
+                        VDR_IQ2_S_Q8_1_MMVQ, vec_dot_iq2_s_q8_1)
 
 #define MMVQ_FUSED_QKV_TYPE_SET(tag, block_q_t, qk_val, qi_val, vdr_val,       \
                                 vec_dot)                                       \
@@ -1447,6 +1507,8 @@ MMVQ_FUSED_QKV_TYPE_SET(q2_0, block_q2_0, QK2_0, 2,
                         VDR_Q2_0_Q8_1_MMVQ, vec_dot_q2_0_q8_1)
 MMVQ_FUSED_QKV_TYPE_SET(iq3xxs, block_iq3_xxs, QK_K, QI3_XXS,
                         VDR_IQ3_XXS_Q8_1_MMVQ, vec_dot_iq3_xxs_q8_1)
+MMVQ_FUSED_QKV_TYPE_SET(iq2s, block_iq2_s, QK_K, QI2_S,
+                        VDR_IQ2_S_Q8_1_MMVQ, vec_dot_iq2_s_q8_1)
 
 // Padding-aware BF16/F16/F32 -> Q8_1 quantize kernels.
 
@@ -1783,6 +1845,7 @@ MMVQ_LAUNCHER_PLAIN(iq4xs, bf16, __nv_bfloat16)
 MMVQ_LAUNCHER_PLAIN(iq4nl, bf16, __nv_bfloat16)
 MMVQ_LAUNCHER_PLAIN(q2_0, bf16, __nv_bfloat16)
 MMVQ_LAUNCHER_PLAIN(iq3xxs, bf16, __nv_bfloat16)
+MMVQ_LAUNCHER_PLAIN(iq2s, bf16, __nv_bfloat16)
 
 MMVQ_LAUNCHER_PLAIN(q4_0, f16, half)
 MMVQ_LAUNCHER_PLAIN(q4_1, f16, half)
@@ -1798,6 +1861,7 @@ MMVQ_LAUNCHER_PLAIN(iq4xs, f16, half)
 MMVQ_LAUNCHER_PLAIN(iq4nl, f16, half)
 MMVQ_LAUNCHER_PLAIN(q2_0, f16, half)
 MMVQ_LAUNCHER_PLAIN(iq3xxs, f16, half)
+MMVQ_LAUNCHER_PLAIN(iq2s, f16, half)
 
 MMVQ_LAUNCHER_PLAIN(q4_0, f32, float)
 MMVQ_LAUNCHER_PLAIN(q4_1, f32, float)
@@ -1813,6 +1877,7 @@ MMVQ_LAUNCHER_PLAIN(iq4xs, f32, float)
 MMVQ_LAUNCHER_PLAIN(iq4nl, f32, float)
 MMVQ_LAUNCHER_PLAIN(q2_0, f32, float)
 MMVQ_LAUNCHER_PLAIN(iq3xxs, f32, float)
+MMVQ_LAUNCHER_PLAIN(iq2s, f32, float)
 
 #define MMVQ_LAUNCHER_FUSED_GLU_TYPE_SET(tag)                                  \
   MMVQ_LAUNCHER_FUSED_GLU(tag, bf16, __nv_bfloat16)                            \
@@ -1833,6 +1898,7 @@ MMVQ_LAUNCHER_FUSED_GLU_TYPE_SET(iq4xs)
 MMVQ_LAUNCHER_FUSED_GLU_TYPE_SET(iq4nl)
 MMVQ_LAUNCHER_FUSED_GLU_TYPE_SET(q2_0)
 MMVQ_LAUNCHER_FUSED_GLU_TYPE_SET(iq3xxs)
+MMVQ_LAUNCHER_FUSED_GLU_TYPE_SET(iq2s)
 
 #define MMVQ_LAUNCHER_FUSED_QKV_TYPE_SET(tag)                                  \
   MMVQ_LAUNCHER_FUSED_QKV(tag, bf16, __nv_bfloat16)                            \
@@ -1853,6 +1919,7 @@ MMVQ_LAUNCHER_FUSED_QKV_TYPE_SET(iq4xs)
 MMVQ_LAUNCHER_FUSED_QKV_TYPE_SET(iq4nl)
 MMVQ_LAUNCHER_FUSED_QKV_TYPE_SET(q2_0)
 MMVQ_LAUNCHER_FUSED_QKV_TYPE_SET(iq3xxs)
+MMVQ_LAUNCHER_FUSED_QKV_TYPE_SET(iq2s)
 
 // Quantize launchers.
 

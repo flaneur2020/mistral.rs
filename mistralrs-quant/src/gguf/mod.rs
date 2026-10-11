@@ -8,6 +8,7 @@ pub mod fast_mmq;
 pub mod fast_mmvq;
 #[cfg(feature = "cuda")]
 mod ffi;
+pub mod iq2s;
 pub mod iq3xxs;
 pub mod iq4nl;
 pub mod iq4xs;
@@ -72,6 +73,7 @@ fn ggml_dtype_to_uqff_code(dtype: GgmlDType) -> u32 {
         GgmlDType::Q6K => 14,
         GgmlDType::Q8K => 15,
         GgmlDType::IQ3_XXS => 18,
+        GgmlDType::IQ2_S => 22,
         GgmlDType::IQ4NL => 20,
         GgmlDType::IQ4XS => 23,
         GgmlDType::Q2_0 => 42,
@@ -97,6 +99,7 @@ fn ggml_dtype_from_uqff_code(dtype: u32) -> Result<GgmlDType> {
         15 => Ok(GgmlDType::Q8K),
         18 => Ok(GgmlDType::IQ3_XXS),
         20 => Ok(GgmlDType::IQ4NL),
+        22 => Ok(GgmlDType::IQ2_S),
         23 => Ok(GgmlDType::IQ4XS),
         42 => Ok(GgmlDType::Q2_0),
         30 => Ok(GgmlDType::BF16),
@@ -122,6 +125,7 @@ fn gguf_dtype_label(dtype: u32) -> String {
         15 => "q8k",
         18 => "iq3_xxs",
         20 => "iq4nl",
+        22 => "iq2_s",
         23 => "iq4xs",
         42 => "q2_0",
         30 => "bf16",
