@@ -6,9 +6,9 @@
 //! the 16-entry sign masks are `KSIGNS_IQ2XS`. The paired activation is Q8_K.
 //!
 //! The **read path** (dequantize + vec-dot) is ported from ggml and checked
-//! against it. The quantizer is a plain grid search, not ggml's
-//! map/neighbour search, so `from_float` produces valid blocks that do not match
-//! ggml byte for byte; nothing in the load path calls it.
+//! against it, with an AVX2 fast path for the vec-dot. The quantizer is a plain
+//! grid search, not ggml's map/neighbour search, so `from_float` produces valid
+//! blocks that do not match ggml byte for byte; nothing in the load path calls it.
 
 use candle_core::{
     bail,
@@ -21,7 +21,7 @@ use candle_core::{
 
 mod tables;
 
-use tables::{IQ3XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS};
+use tables::{IQ3XXS_GRID, KEVEN_SIGNS_Q2XS, KMASK_IQ2XS, KSIGNS_IQ2XS};
 
 /// Elements per IQ3_XXS super-block.
 pub const QK_K: usize = 256;
@@ -179,9 +179,20 @@ pub fn quantize_row_q8_k(x: &[f32], dst: &mut [u8]) -> Result<()> {
     Ok(())
 }
 
-/// Dot product of packed IQ3_XXS weights against packed Q8_K activations,
-/// mirroring `ggml_vec_dot_iq3_xxs_q8_K_generic`.
+/// Dot product of packed IQ3_XXS weights against packed Q8_K activations.
+///
+/// Uses AVX2 when the CPU has it.
 pub fn vec_dot_q8_k(w: &[u8], q8: &[u8]) -> Result<f32> {
+    check_dot(w, q8)?;
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        // SAFETY: guarded by the runtime feature check.
+        return unsafe { vec_dot_q8_k_avx2(w, q8) };
+    }
+    vec_dot_q8_k_scalar(w, q8)
+}
+
+fn check_dot(w: &[u8], q8: &[u8]) -> Result<usize> {
     if !w.len().is_multiple_of(BLOCK_BYTES) {
         bail!(
             "IQ3_XXS: weight length {} is not a multiple of {BLOCK_BYTES}",
@@ -196,6 +207,12 @@ pub fn vec_dot_q8_k(w: &[u8], q8: &[u8]) -> Result<f32> {
             nb * Q8K_BYTES
         );
     }
+    Ok(nb)
+}
+
+/// Scalar dot, mirroring `ggml_vec_dot_iq3_xxs_q8_K_generic`.
+pub fn vec_dot_q8_k_scalar(w: &[u8], q8: &[u8]) -> Result<f32> {
+    let nb = check_dot(w, q8)?;
     let mut sumf = 0f32;
     for b in 0..nb {
         let wb = &w[b * BLOCK_BYTES..(b + 1) * BLOCK_BYTES];
@@ -229,6 +246,74 @@ pub fn vec_dot_q8_k(w: &[u8], q8: &[u8]) -> Result<f32> {
         sumf += d * bsum as f32;
     }
     Ok(0.25 * sumf)
+}
+
+/// Sum the eight `f32` lanes of `x` (ggml's `hsum_float_8`).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn hsum_float_8(x: std::arch::x86_64::__m256) -> f32 {
+    use std::arch::x86_64::*;
+    let lo = _mm256_castps256_ps128(x);
+    let hi = _mm256_extractf128_ps(x, 1);
+    let s = _mm_add_ps(lo, hi);
+    let s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    _mm_cvtss_f32(_mm_add_ss(s, _mm_shuffle_ps(s, s, 0x55)))
+}
+
+/// AVX2 dot, mirroring the `__AVX2__` branch of `ggml_vec_dot_iq3_xxs_q8_K`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn vec_dot_q8_k_avx2(w: &[u8], q8: &[u8]) -> Result<f32> {
+    use std::arch::x86_64::*;
+    let nb = w.len() / BLOCK_BYTES;
+    let mut accumf = _mm256_setzero_ps();
+    for i in 0..nb {
+        let wb = w.as_ptr().add(i * BLOCK_BYTES);
+        let qb = q8.as_ptr().add(i * Q8K_BYTES);
+        let d = f16_to_f32(rd_u16(w, i * BLOCK_BYTES)) * rd_f32(q8, i * Q8K_BYTES);
+        let mut q3 = wb.add(2);
+        let mut gas = wb.add(2 + QK_K / 4);
+        let mut q8p = qb.add(4);
+        let mut sumi1 = _mm256_setzero_si256();
+        let mut sumi2 = _mm256_setzero_si256();
+        for _ in 0..QK_K / 64 {
+            let q8_1 = _mm256_loadu_si256(q8p as *const __m256i);
+            let q8_2 = _mm256_loadu_si256(q8p.add(32) as *const __m256i);
+            q8p = q8p.add(64);
+            let g = |o: usize| *IQ3XXS_GRID.get_unchecked(*q3.add(o) as usize) as i32;
+            let q2_1 = _mm256_set_epi32(g(7), g(6), g(5), g(4), g(3), g(2), g(1), g(0));
+            let q2_2 = _mm256_set_epi32(g(15), g(14), g(13), g(12), g(11), g(10), g(9), g(8));
+            q3 = q3.add(16);
+            let aux0 = (gas as *const u32).read_unaligned();
+            let aux1 = (gas.add(4) as *const u32).read_unaligned();
+            gas = gas.add(8);
+            let sgn = |x: u32, sh: u32| {
+                *KEVEN_SIGNS_Q2XS.get_unchecked(((x >> sh) & 127) as usize) as i64
+            };
+            let s2_1 = _mm256_set_epi64x(sgn(aux0, 21), sgn(aux0, 14), sgn(aux0, 7), sgn(aux0, 0));
+            let s2_2 = _mm256_set_epi64x(sgn(aux1, 21), sgn(aux1, 14), sgn(aux1, 7), sgn(aux1, 0));
+            let q8s_1 = _mm256_sign_epi8(q8_1, s2_1);
+            let q8s_2 = _mm256_sign_epi8(q8_2, s2_2);
+            let p1 = _mm256_madd_epi16(
+                _mm256_maddubs_epi16(q2_1, q8s_1),
+                _mm256_set1_epi16(2 * ((aux0 >> 28) as i16) + 1),
+            );
+            let p2 = _mm256_madd_epi16(
+                _mm256_maddubs_epi16(q2_2, q8s_2),
+                _mm256_set1_epi16(2 * ((aux1 >> 28) as i16) + 1),
+            );
+            sumi1 = _mm256_add_epi32(sumi1, p1);
+            sumi2 = _mm256_add_epi32(sumi2, p2);
+        }
+        accumf = _mm256_add_ps(
+            _mm256_mul_ps(
+                _mm256_set1_ps(d),
+                _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1, sumi2)),
+            ),
+            accumf,
+        );
+    }
+    Ok(0.25 * hsum_float_8(accumf))
 }
 
 /// Quantize `x` into packed IQ3_XXS blocks.

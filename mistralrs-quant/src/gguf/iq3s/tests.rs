@@ -635,3 +635,28 @@ fn cuda_grouped_moe_gemm_matches_the_cpu_kernel() {
         );
     }
 }
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn avx2_and_scalar_agree() {
+    if !is_x86_feature_detected!("avx2") {
+        return;
+    }
+    let o = oracle();
+    for (raw, q8, nb, what) in [
+        (o.real_raw, o.real_q8, o.nb_real, "real"),
+        (o.syn_raw, o.syn_q8, o.nb_syn, "syn"),
+    ] {
+        for b in 0..nb {
+            let w = &raw[b * BLOCK_BYTES..(b + 1) * BLOCK_BYTES];
+            let q = &q8[b * Q8K_BYTES..(b + 1) * Q8K_BYTES];
+            let s = vec_dot_q8_k_scalar(w, q).unwrap();
+            // SAFETY: guarded by the runtime AVX2 check.
+            let a = unsafe { vec_dot_q8_k_avx2(w, q) }.unwrap();
+            assert!(
+                (s - a).abs() <= 1e-4 * s.abs().max(1.0),
+                "{what} block {b}: scalar {s} vs avx2 {a}"
+            );
+        }
+    }
+}

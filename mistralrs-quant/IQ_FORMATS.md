@@ -14,12 +14,15 @@ the `GgmlDType` variant (see below); the loader builds the storage with
 | IQ4_XS | 23 | 256 el / 136 B | Q8_K | scalar + AVX2 | `indexed_moe`, `mmvq_gguf`, `moe_grouped`, `mmq_gguf` |
 | IQ4_NL | 20 | 32 el / 18 B | Q8_0 | scalar + AVX2 | `indexed_moe`, `mmvq_gguf`, `moe_grouped`, `mmq_gguf` |
 | Q2_0 | 42 | 64 el / 18 B | Q8_0 (2 per block) | scalar | `indexed_moe`, `mmvq_gguf`, `moe_grouped` |
-| IQ3_XXS | 18 | 256 el / 98 B | Q8_K | scalar | `indexed_moe`, `mmvq_gguf`, `moe_grouped` |
-| IQ2_S | 22 | 256 el / 82 B | Q8_K | scalar | `indexed_moe`, `mmvq_gguf`, `moe_grouped` |
-| IQ3_S | 21 | 256 el / 110 B | Q8_K | scalar | `indexed_moe`, `mmvq_gguf`, `moe_grouped` |
+| IQ3_XXS | 18 | 256 el / 98 B | Q8_K | scalar + AVX2 | `indexed_moe`, `mmvq_gguf`, `moe_grouped` |
+| IQ2_S | 22 | 256 el / 82 B | Q8_K | scalar + AVX2 | `indexed_moe`, `mmvq_gguf`, `moe_grouped` |
+| IQ3_S | 21 | 256 el / 110 B | Q8_K | scalar + AVX2 | `indexed_moe`, `mmvq_gguf`, `moe_grouped` |
 
 Each has: an oracle generated from ggml (`tools/iq4xs`, `tools/iq4nl`,
 `tools/q2_0`, `tools/iq3xxs`, `tools/iq2s`, `tools/iq3_s`), CPU oracle tests, and
+an AVX2-vs-scalar agreement test. Only Q2_0 has a scalar-only CPU dot: ggml
+itself ships no x86 SIMD for it (arm/loongarch/wasm only), so there is nothing
+to port.
 CUDA tests that compare every kernel against the CPU kernel. Q2_0/IQ3_XXS/IQ2_S/
 IQ3_S have no MMQ kernel (dense batches over 8 chunk through MMVQ). Q2_0 has no
 SIMD dot either (ggml has none); the others leave the fork's `mmq_common.cuh`

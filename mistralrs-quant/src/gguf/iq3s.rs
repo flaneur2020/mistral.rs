@@ -6,9 +6,9 @@
 //! paired activation is Q8_K.
 //!
 //! The **read path** (dequantize + vec-dot) is ported from ggml and checked
-//! against it. The quantizer is a plain grid search, not ggml's
-//! map/neighbour search, so `from_float` produces valid blocks that do not match
-//! ggml byte for byte; nothing in the load path calls it.
+//! against it, with an AVX2 fast path for the vec-dot. The quantizer is a plain
+//! grid search, not ggml's map/neighbour search, so `from_float` produces valid
+//! blocks that do not match ggml byte for byte; nothing in the load path calls it.
 
 use candle_core::{
     bail,
@@ -182,9 +182,20 @@ pub fn quantize_row_q8_k(x: &[f32], dst: &mut [u8]) -> Result<()> {
     Ok(())
 }
 
-/// Dot product of packed IQ3_S weights against packed Q8_K activations,
-/// mirroring `ggml_vec_dot_iq3_s_q8_K_generic`.
+/// Dot product of packed IQ3_S weights against packed Q8_K activations.
+///
+/// Uses AVX2 when the CPU has it.
 pub fn vec_dot_q8_k(w: &[u8], q8: &[u8]) -> Result<f32> {
+    check_dot(w, q8)?;
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        // SAFETY: guarded by the runtime feature check.
+        return unsafe { vec_dot_q8_k_avx2(w, q8) };
+    }
+    vec_dot_q8_k_scalar(w, q8)
+}
+
+fn check_dot(w: &[u8], q8: &[u8]) -> Result<usize> {
     if !w.len().is_multiple_of(BLOCK_BYTES) {
         bail!(
             "IQ3_S: weight length {} is not a multiple of {BLOCK_BYTES}",
@@ -199,6 +210,12 @@ pub fn vec_dot_q8_k(w: &[u8], q8: &[u8]) -> Result<f32> {
             nb * Q8K_BYTES
         );
     }
+    Ok(nb)
+}
+
+/// Scalar dot, mirroring `ggml_vec_dot_iq3_s_q8_K_generic`.
+pub fn vec_dot_q8_k_scalar(w: &[u8], q8: &[u8]) -> Result<f32> {
+    let nb = check_dot(w, q8)?;
     let mut sumf = 0f32;
     for b in 0..nb {
         let wb = &w[b * BLOCK_BYTES..(b + 1) * BLOCK_BYTES];
@@ -235,6 +252,103 @@ pub fn vec_dot_q8_k(w: &[u8], q8: &[u8]) -> Result<f32> {
         sumf += d * bsum as f32;
     }
     Ok(sumf)
+}
+
+/// Sum the eight `f32` lanes of `x` (ggml's `hsum_float_8`).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn hsum_float_8(x: std::arch::x86_64::__m256) -> f32 {
+    use std::arch::x86_64::*;
+    let lo = _mm256_castps256_ps128(x);
+    let hi = _mm256_extractf128_ps(x, 1);
+    let s = _mm_add_ps(lo, hi);
+    let s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    _mm_cvtss_f32(_mm_add_ss(s, _mm_shuffle_ps(s, s, 0x55)))
+}
+
+/// `k_mask1` from ggml's AVX2 IQ3_S dot: pick byte 0/1/2/3 of each 32-bit lane.
+#[cfg(target_arch = "x86_64")]
+const IQ3S_MASK1: [u8; 32] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3,
+];
+
+/// `k_mask2`: one bit per sign, repeated four times.
+#[cfg(target_arch = "x86_64")]
+const IQ3S_MASK2: [u8; 32] = [
+    1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4,
+    8, 16, 32, 64, 128,
+];
+
+/// AVX2 dot, mirroring the `__AVX2__` branch of `ggml_vec_dot_iq3_s_q8_K`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn vec_dot_q8_k_avx2(w: &[u8], q8: &[u8]) -> Result<f32> {
+    use std::arch::x86_64::*;
+    let nb = w.len() / BLOCK_BYTES;
+    let mask1 = _mm256_loadu_si256(IQ3S_MASK1.as_ptr() as *const __m256i);
+    let mask2 = _mm256_loadu_si256(IQ3S_MASK2.as_ptr() as *const __m256i);
+    let mut accumf = _mm256_setzero_ps();
+    for i in 0..nb {
+        let wb = w.as_ptr().add(i * BLOCK_BYTES);
+        let qb = q8.as_ptr().add(i * Q8K_BYTES);
+        let d = f16_to_f32(rd_u16(w, i * BLOCK_BYTES)) * rd_f32(q8, i * Q8K_BYTES);
+        let mut qs = wb.add(2);
+        let qh = wb.add(66);
+        let mut signs = wb.add(74) as *const u16;
+        let scales = wb.add(106);
+        let mut q8p = qb.add(4);
+        let mut sumi1 = _mm256_setzero_si256();
+        let mut sumi2 = _mm256_setzero_si256();
+        for ib32 in (0..8).step_by(2) {
+            let q8_1 = _mm256_loadu_si256(q8p as *const __m256i);
+            let q8_2 = _mm256_loadu_si256(q8p.add(32) as *const __m256i);
+            q8p = q8p.add(64);
+            let mut idx = [0usize; 16];
+            for (j, slot) in idx.iter_mut().enumerate() {
+                *slot = (*qs.add(j) as usize)
+                    | (((*qh.add(ib32 + j / 8) as usize) << (8 - j % 8)) & 0x100);
+            }
+            qs = qs.add(16);
+            let g = |j: usize| *IQ3S_GRID.get_unchecked(idx[j]) as i32;
+            let q2_1 = _mm256_set_epi32(g(7), g(6), g(5), g(4), g(3), g(2), g(1), g(0));
+            let q2_2 = _mm256_set_epi32(g(15), g(14), g(13), g(12), g(11), g(10), g(9), g(8));
+            let s0 = signs.read_unaligned() as u32;
+            let s1 = signs.add(1).read_unaligned() as u32;
+            let s2 = signs.add(2).read_unaligned() as u32;
+            let s3 = signs.add(3).read_unaligned() as u32;
+            signs = signs.add(4);
+            let sign_mask = |packed: u32| {
+                let aux = _mm256_set1_epi32(packed as i32);
+                _mm256_cmpeq_epi8(
+                    _mm256_and_si256(_mm256_shuffle_epi8(aux, mask1), mask2),
+                    mask2,
+                )
+            };
+            let sg1 = sign_mask(s0 | (s1 << 16));
+            let sg2 = sign_mask(s2 | (s3 << 16));
+            let q8s_1 = _mm256_sub_epi8(_mm256_xor_si256(sg1, q8_1), sg1);
+            let q8s_2 = _mm256_sub_epi8(_mm256_xor_si256(sg2, q8_2), sg2);
+            let sc = *scales.add(ib32 / 2) as i16;
+            let p1 = _mm256_madd_epi16(
+                _mm256_maddubs_epi16(q2_1, q8s_1),
+                _mm256_set1_epi16(2 * (sc & 0xf) + 1),
+            );
+            let p2 = _mm256_madd_epi16(
+                _mm256_maddubs_epi16(q2_2, q8s_2),
+                _mm256_set1_epi16(2 * (sc >> 4) + 1),
+            );
+            sumi1 = _mm256_add_epi32(sumi1, p1);
+            sumi2 = _mm256_add_epi32(sumi2, p2);
+        }
+        accumf = _mm256_add_ps(
+            _mm256_mul_ps(
+                _mm256_set1_ps(d),
+                _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1, sumi2)),
+            ),
+            accumf,
+        );
+    }
+    Ok(hsum_float_8(accumf))
 }
 
 /// Quantize `x` into packed IQ3_S blocks.
