@@ -152,6 +152,10 @@ fn routed_gemv(qtensor: &QTensor, x: &Tensor, ids: &Tensor) -> Result<Option<Ten
     Ok(Some(out.to_dtype(x.dtype())?))
 }
 
+/// Output rows per rayon task in `gemv`: enough to amortize a task, few enough that one expert
+/// spreads over every thread (decode rows are 640-2560 long here).
+const ROWS_PER_TASK: usize = 32;
+
 /// `dst[t, j, :] = W[ids[t, j]] · x[t, j or 0]` with `W` the `[E, n, k]` blocks of type `T`.
 fn gemv<T: GgmlType>(
     data: &[u8],
@@ -187,14 +191,20 @@ fn gemv<T: GgmlType>(
         .for_each(|(dst, src)| T::VecDotType::from_float(src, dst));
 
     let mut dst = vec![0f32; tokens * topk * n];
+    // Rows are split too: a decode step often routes only a couple of experts here (the rest
+    // run elsewhere), which would otherwise leave all but a couple of threads idle.
     dst.par_chunks_mut(n).enumerate().for_each(|(slot, out)| {
         let (t, j) = (slot / topk, slot % topk);
         let xrow = t * x_t + if x_t == 1 { 0 } else { j };
         let x = &xq[xrow * vd_row..(xrow + 1) * vd_row];
         let w = &blocks[ids[slot] as usize * expert_blocks..][..expert_blocks];
-        for (o, row) in out.iter_mut().zip(w.chunks_exact(row_blocks)) {
-            *o = T::vec_dot(k, row, x);
-        }
+        out.par_chunks_mut(ROWS_PER_TASK)
+            .zip(w.par_chunks(ROWS_PER_TASK * row_blocks))
+            .for_each(|(out, w)| {
+                for (o, row) in out.iter_mut().zip(w.chunks_exact(row_blocks)) {
+                    *o = T::vec_dot(k, row, x);
+                }
+            });
     });
     Ok(dst)
 }
@@ -372,5 +382,116 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+/// Throughput microbenchmark for the per-dtype CPU vec-dot that `--cpu-moe`
+/// decode drives. Run with:
+///
+/// ```text
+/// cargo test -p mistralrs-quant --lib -- --ignored --nocapture bench_vec_dot_throughput
+/// ```
+#[cfg(test)]
+mod throughput_bench {
+    use candle_core::quantized::{
+        k_quants::{BlockQ2K, BlockQ3K, BlockQ4K, BlockQ4_0},
+        GgmlType,
+    };
+    use rayon::prelude::*;
+    use std::time::Instant;
+
+    use crate::gguf::cpu::ROWS_PER_TASK;
+    use crate::gguf::{
+        iq2s::BlockIQ2S, iq3s::BlockIQ3S, iq3xxs::BlockIQ3XXS, iq4nl::BlockIQ4NL,
+        iq4xs::BlockIQ4XS, q2_0::BlockQ2_0,
+    };
+
+    fn pack<T: GgmlType>(n_rows: usize, k: usize) -> Vec<u8> {
+        let row_bytes = (k / T::BLCK_SIZE) * T::DTYPE.type_size();
+        let mut raw = vec![0u8; n_rows * row_bytes];
+        let mut s = 12345u32;
+        for b in raw.iter_mut() {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            *b = (s >> 24) as u8;
+        }
+        raw
+    }
+
+    fn run<T: GgmlType + Send + Sync>(
+        label: &str,
+        n: usize,
+        k: usize,
+        experts: usize,
+        iters: usize,
+    ) {
+        let rb = k / T::BLCK_SIZE;
+        let row_bytes = rb * T::DTYPE.type_size();
+        let n_rows = n * experts;
+        let raw = pack::<T>(n_rows, k);
+        assert_eq!(raw.as_ptr().align_offset(std::mem::align_of::<T>()), 0);
+        // SAFETY: packed blocks laid out for `T`.
+        let blocks: &[T] =
+            unsafe { std::slice::from_raw_parts(raw.as_ptr().cast::<T>(), n_rows * rb) };
+
+        let x: Vec<f32> = (0..k).map(|i| ((i as f32) * 0.013).sin()).collect();
+        let vd = k / T::VecDotType::BLCK_SIZE;
+        let mut xq = vec![T::VecDotType::zeros(); vd];
+        T::VecDotType::from_float(&x, &mut xq);
+
+        let bytes = (n_rows * row_bytes) as f64;
+        let mut out = vec![0f32; n_rows];
+
+        let t = Instant::now();
+        for _ in 0..iters {
+            for (o, row) in out.iter_mut().zip(blocks.chunks_exact(rb)) {
+                *o = T::vec_dot(k, row, &xq);
+            }
+        }
+        let s1 = t.elapsed().as_secs_f64();
+
+        let mut dst = vec![0f32; n_rows];
+        let t = Instant::now();
+        for _ in 0..iters {
+            dst.par_chunks_mut(n).enumerate().for_each(|(e, out)| {
+                let w = &blocks[e * n * rb..][..n * rb];
+                out.par_chunks_mut(ROWS_PER_TASK)
+                    .zip(w.par_chunks(ROWS_PER_TASK * rb))
+                    .for_each(|(out, w)| {
+                        for (o, row) in out.iter_mut().zip(w.chunks_exact(rb)) {
+                            *o = T::vec_dot(k, row, &xq);
+                        }
+                    });
+            });
+        }
+        let sm = t.elapsed().as_secs_f64();
+
+        println!(
+            "{label:<8} {n:>5}x{k:<5} {experts:>2}e  1T {:5.2} GB/s   split {:5.2} GB/s  {:6.0} us/call",
+            bytes * iters as f64 / s1 / 1e9,
+            bytes * iters as f64 / sm / 1e9,
+            sm / iters as f64 * 1e6
+        );
+    }
+
+    #[test]
+    #[ignore = "throughput microbenchmark"]
+    fn bench_vec_dot_throughput() {
+        println!("rayon threads: {}", rayon::current_num_threads());
+        println!("--- gate/up (n=640, k=2560), 10 experts/token ---");
+        let (n, k, e) = (640usize, 2560usize, 10usize);
+        run::<BlockIQ2S>("IQ2_S", n, k, e, 20);
+        run::<BlockIQ3XXS>("IQ3_XXS", n, k, e, 20);
+        run::<BlockIQ3S>("IQ3_S", n, k, e, 20);
+        run::<BlockIQ4NL>("IQ4_NL", n, k, e, 20);
+        run::<BlockIQ4XS>("IQ4_XS", n, k, e, 20);
+        println!("--- candle K-quants (requant baseline) ---");
+        run::<BlockQ2K>("Q2_K", n, k, e, 20);
+        run::<BlockQ3K>("Q3_K", n, k, e, 20);
+        run::<BlockQ4K>("Q4_K", n, k, e, 20);
+        println!("--- down (n=2560, k=640), 10 experts/token ---");
+        let (n, k) = (2560usize, 640usize);
+        run::<BlockQ2_0>("Q2_0", n, k, e, 20);
+        run::<BlockIQ4NL>("IQ4_NL", n, k, e, 20);
+        run::<BlockQ4_0>("Q4_0", n, k, e, 20);
     }
 }

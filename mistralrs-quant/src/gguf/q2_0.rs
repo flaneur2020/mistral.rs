@@ -129,8 +129,18 @@ pub fn quantize_row_q8_0(x: &[f32], dst: &mut [u8]) -> Result<()> {
 
 /// Dot product of packed Q2_0 weights against packed Q8_0 activations.
 ///
-/// Scalar only (see [`dequantize`]).
+/// Uses AVX2 when the CPU has it.
 pub fn vec_dot_q8_0(w: &[u8], q8: &[u8]) -> Result<f32> {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        // SAFETY: guarded by the runtime feature check.
+        return unsafe { vec_dot_q8_0_avx2(w, q8) };
+    }
+    vec_dot_q8_0_scalar(w, q8)
+}
+
+/// Scalar dot, mirroring ggml's `ggml_vec_dot_q2_0_q8_0`.
+pub fn vec_dot_q8_0_scalar(w: &[u8], q8: &[u8]) -> Result<f32> {
     let nb = check_dot(w, q8)?;
     let mut sumf = 0f32;
     for b in 0..nb {
@@ -138,6 +148,53 @@ pub fn vec_dot_q8_0(w: &[u8], q8: &[u8]) -> Result<f32> {
             &w[b * BLOCK_BYTES..(b + 1) * BLOCK_BYTES],
             &q8[b * 2 * Q8_0_BYTES..(b + 1) * 2 * Q8_0_BYTES],
         );
+    }
+    Ok(sumf)
+}
+
+/// Sum the eight `i32` lanes of `x`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn hsum_epi32(x: std::arch::x86_64::__m256i) -> i32 {
+    use std::arch::x86_64::*;
+    let s = _mm_add_epi32(_mm256_castsi256_si128(x), _mm256_extracti128_si256(x, 1));
+    let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0x4e));
+    _mm_cvtsi128_si32(_mm_add_epi32(s, _mm_shuffle_epi32(s, 0xb1)))
+}
+
+/// AVX2 dot. Unlike the grid formats Q2_0 has no codebook, so the four 2-bit
+/// codes of each byte expand to the signed bytes `-1/0/1/2` (the value is
+/// `code - 1`) and the dot is a plain `maddubs` against the signed activation.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn vec_dot_q8_0_avx2(w: &[u8], q8: &[u8]) -> Result<f32> {
+    use std::arch::x86_64::*;
+    let nb = check_dot(w, q8)?;
+    let m3 = _mm_set1_epi8(3);
+    let ones = _mm256_set1_epi16(1);
+    let mut sumf = 0f32;
+    for b in 0..nb {
+        let wb = w.as_ptr().add(b * BLOCK_BYTES);
+        let qb = q8.as_ptr().add(b * 2 * Q8_0_BYTES);
+        let d0 = f16_to_f32(rd_u16(w, b * BLOCK_BYTES));
+        for k in 0..2 {
+            // Eight qs bytes -> 32 elements, four crumbs per byte, in element order.
+            let qsb = _mm_loadl_epi64(wb.add(2 + k * 8) as *const __m128i);
+            let c0 = _mm_sub_epi8(_mm_and_si128(qsb, m3), _mm_set1_epi8(1));
+            let c1 = _mm_sub_epi8(_mm_and_si128(_mm_srli_epi16(qsb, 2), m3), _mm_set1_epi8(1));
+            let c2 = _mm_sub_epi8(_mm_and_si128(_mm_srli_epi16(qsb, 4), m3), _mm_set1_epi8(1));
+            let c3 = _mm_sub_epi8(_mm_and_si128(_mm_srli_epi16(qsb, 6), m3), _mm_set1_epi8(1));
+            let t0 = _mm_unpacklo_epi8(c0, c1);
+            let t1 = _mm_unpacklo_epi8(c2, c3);
+            let weights = _mm256_set_m128i(_mm_unpackhi_epi16(t0, t1), _mm_unpacklo_epi16(t0, t1));
+
+            let qy = _mm256_loadu_si256(qb.add(k * Q8_0_BYTES + 2) as *const __m256i);
+            let signed = _mm256_sign_epi8(qy, weights);
+            let p = _mm256_maddubs_epi16(_mm256_abs_epi8(weights), signed);
+            let sumi = hsum_epi32(_mm256_madd_epi16(p, ones));
+            let d1 = f16_to_f32(rd_u16(q8, b * 2 * Q8_0_BYTES + k * Q8_0_BYTES));
+            sumf += d0 * d1 * sumi as f32;
+        }
     }
     Ok(sumf)
 }
