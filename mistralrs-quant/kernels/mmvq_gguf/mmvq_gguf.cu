@@ -237,6 +237,14 @@ typedef struct {
   uint8_t qs[QK2_0 / 4];
 } block_q2_0;
 
+// IQ3_XXS (GGML type 18): 256-element super-block; 64 grid-index bytes then 32
+// scale/sign bytes.
+typedef struct {
+  half d;
+  uint8_t qs[3 * QK_K / 8];
+} block_iq3_xxs;
+
+
 #define QK4_0 32
 #define QR4_0 2
 #define QI4_0 (QK4_0 / (4 * QR4_0))
@@ -286,6 +294,8 @@ typedef struct {
 #define VDR_IQ4_XS_Q8_1_MMVQ 1
 #define VDR_IQ4_NL_Q8_1_MMVQ 1
 #define VDR_Q2_0_Q8_1_MMVQ 1
+#define QI3_XXS 16
+#define VDR_IQ3_XXS_Q8_1_MMVQ 2
 
 // ---------------------------------------------------------------------------
 // vec_dot impl helpers (per-quant-type)
@@ -736,6 +746,84 @@ vec_dot_q2_0_q8_1(const void *__restrict__ vbq,
     sumi += (((byte >> 6) & 3) - 1) * (int)qy[j * 4 + 3];
   }
   return __half2float(bq2->d) * __low2float(chunk->ds) * sumi;
+}
+
+static __device__ __forceinline__ int iq3_get_int_b2(const void *x,
+                                                     const int &i32) {
+  const uint16_t *x16 = (const uint16_t *)x;
+  return (x16[2 * i32 + 0] << 0) | (x16[2 * i32 + 1] << 16);
+}
+
+static __device__ __forceinline__ uint32_t iq3_unpack_ksigns(const uint8_t v) {
+  const uint32_t p = __popc(v) & 1;
+  return (v ^ (p << 7)) * 0x01010101u;
+}
+
+static const __device__ uint32_t iq3xxs_grid[256] = {
+    0x04040404, 0x04040414, 0x04040424, 0x04040c0c, 0x04040c1c, 0x04040c3e, 0x04041404, 0x04041414,
+    0x04041c0c, 0x04042414, 0x04043e1c, 0x04043e2c, 0x040c040c, 0x040c041c, 0x040c0c04, 0x040c0c14,
+    0x040c140c, 0x040c142c, 0x040c1c04, 0x040c1c14, 0x040c240c, 0x040c2c24, 0x040c3e04, 0x04140404,
+    0x04140414, 0x04140424, 0x04140c0c, 0x04141404, 0x04141414, 0x04141c0c, 0x04141c1c, 0x04141c3e,
+    0x04142c0c, 0x04142c3e, 0x04143e2c, 0x041c040c, 0x041c043e, 0x041c0c04, 0x041c0c14, 0x041c142c,
+    0x041c3e04, 0x04240c1c, 0x04241c3e, 0x04242424, 0x04242c3e, 0x04243e1c, 0x04243e2c, 0x042c040c,
+    0x042c043e, 0x042c1c14, 0x042c2c14, 0x04341c2c, 0x04343424, 0x043e0c04, 0x043e0c24, 0x043e0c34,
+    0x043e241c, 0x043e340c, 0x0c04040c, 0x0c04041c, 0x0c040c04, 0x0c040c14, 0x0c04140c, 0x0c04141c,
+    0x0c041c04, 0x0c041c14, 0x0c041c24, 0x0c04243e, 0x0c042c04, 0x0c0c0404, 0x0c0c0414, 0x0c0c0c0c,
+    0x0c0c1404, 0x0c0c1414, 0x0c14040c, 0x0c14041c, 0x0c140c04, 0x0c140c14, 0x0c14140c, 0x0c141c04,
+    0x0c143e14, 0x0c1c0404, 0x0c1c0414, 0x0c1c1404, 0x0c1c1c0c, 0x0c1c2434, 0x0c1c3434, 0x0c24040c,
+    0x0c24042c, 0x0c242c04, 0x0c2c1404, 0x0c2c1424, 0x0c2c2434, 0x0c2c3e0c, 0x0c34042c, 0x0c3e1414,
+    0x0c3e2404, 0x14040404, 0x14040414, 0x14040c0c, 0x14040c1c, 0x14041404, 0x14041414, 0x14041434,
+    0x14041c0c, 0x14042414, 0x140c040c, 0x140c041c, 0x140c042c, 0x140c0c04, 0x140c0c14, 0x140c140c,
+    0x140c1c04, 0x140c341c, 0x140c343e, 0x140c3e04, 0x14140404, 0x14140414, 0x14140c0c, 0x14140c3e,
+    0x14141404, 0x14141414, 0x14141c3e, 0x14142404, 0x14142c2c, 0x141c040c, 0x141c0c04, 0x141c0c24,
+    0x141c3e04, 0x141c3e24, 0x14241c2c, 0x14242c1c, 0x142c041c, 0x142c143e, 0x142c240c, 0x142c3e24,
+    0x143e040c, 0x143e041c, 0x143e0c34, 0x143e242c, 0x1c04040c, 0x1c040c04, 0x1c040c14, 0x1c04140c,
+    0x1c04141c, 0x1c042c04, 0x1c04342c, 0x1c043e14, 0x1c0c0404, 0x1c0c0414, 0x1c0c1404, 0x1c0c1c0c,
+    0x1c0c2424, 0x1c0c2434, 0x1c14040c, 0x1c14041c, 0x1c140c04, 0x1c14142c, 0x1c142c14, 0x1c143e14,
+    0x1c1c0c0c, 0x1c1c1c1c, 0x1c241c04, 0x1c24243e, 0x1c243e14, 0x1c2c0404, 0x1c2c0434, 0x1c2c1414,
+    0x1c2c2c2c, 0x1c340c24, 0x1c341c34, 0x1c34341c, 0x1c3e1c1c, 0x1c3e3404, 0x24040424, 0x24040c3e,
+    0x24041c2c, 0x24041c3e, 0x24042c1c, 0x24042c3e, 0x240c3e24, 0x24141404, 0x24141c3e, 0x24142404,
+    0x24143404, 0x24143434, 0x241c043e, 0x241c242c, 0x24240424, 0x24242c0c, 0x24243424, 0x242c142c,
+    0x242c241c, 0x242c3e04, 0x243e042c, 0x243e0c04, 0x243e0c14, 0x243e1c04, 0x2c040c14, 0x2c04240c,
+    0x2c043e04, 0x2c0c0404, 0x2c0c0434, 0x2c0c1434, 0x2c0c2c2c, 0x2c140c24, 0x2c141c14, 0x2c143e14,
+    0x2c1c0414, 0x2c1c2c1c, 0x2c240c04, 0x2c24141c, 0x2c24143e, 0x2c243e14, 0x2c2c0414, 0x2c2c1c0c,
+    0x2c342c04, 0x2c3e1424, 0x2c3e2414, 0x34041424, 0x34042424, 0x34042434, 0x34043424, 0x340c140c,
+    0x340c340c, 0x34140c3e, 0x34143424, 0x341c1c04, 0x341c1c34, 0x34242424, 0x342c042c, 0x342c2c14,
+    0x34341c1c, 0x343e041c, 0x343e140c, 0x3e04041c, 0x3e04042c, 0x3e04043e, 0x3e040c04, 0x3e041c14,
+    0x3e042c14, 0x3e0c1434, 0x3e0c2404, 0x3e140c14, 0x3e14242c, 0x3e142c14, 0x3e1c0404, 0x3e1c0c2c,
+    0x3e1c1c1c, 0x3e1c3404, 0x3e24140c, 0x3e24240c, 0x3e2c0404, 0x3e2c0414, 0x3e2c1424, 0x3e341c04,
+};
+
+// IQ3_XXS: one 32-element group per call (`iqs` is even, 0..14).
+static __device__ __forceinline__ float
+vec_dot_iq3_xxs_q8_1(const void *__restrict__ vbq,
+                     const block_q8_1 *__restrict__ bq8_1, const int &kbx,
+                     const int &iqs) {
+  const block_iq3_xxs *bq3 =
+      (const block_iq3_xxs *)vbq + kbx;
+  const int2 q3_packed = make_int2(iq3_get_int_b2(bq3->qs, iqs),
+                                    iq3_get_int_b2(bq3->qs, iqs + 1));
+  const uint8_t *q3 = (const uint8_t *)&q3_packed;
+  const uint32_t aux32 = iq3_get_int_b2(bq3->qs, QK_K / 16 + iqs / 2);
+  int sumi = 0;
+#pragma unroll
+  for (int l0 = 0; l0 < 8; l0 += 2) {
+    const int2 grid_pos =
+        make_int2(iq3xxs_grid[q3[l0 + 0]], iq3xxs_grid[q3[l0 + 1]]);
+    const uint32_t signs = iq3_unpack_ksigns(aux32 >> (7 * l0 / 2));
+    const int signs0 = __vcmpne4(signs & 0x08040201, 0);
+    const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+    const int u0 = get_int_from_int8_aligned(bq8_1[iqs / 2].qs, l0 + 0);
+    const int signs1 = __vcmpne4(signs & 0x80402010, 0);
+    const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+    const int u1 = get_int_from_int8_aligned(bq8_1[iqs / 2].qs, l0 + 1);
+    sumi = ggml_cuda_dp4a(grid_l, u0, sumi);
+    sumi = ggml_cuda_dp4a(grid_h, u1, sumi);
+  }
+  const int ls = aux32 >> 28;
+  sumi = (ls * sumi + sumi / 2) / 2;
+  const float d = __half2float(bq3->d) * __low2float(bq8_1[iqs / 2].ds);
+  return d * sumi;
 }
 
 static __device__ __forceinline__ float
@@ -1281,6 +1369,8 @@ MMVQ_PLAIN_BATCH_SET(iq4nl, block_iq4_nl, QK4_NL, 1, VDR_IQ4_NL_Q8_1_MMVQ,
                      vec_dot_iq4_nl_q8_1)
 MMVQ_PLAIN_BATCH_SET(q2_0, block_q2_0, QK2_0, 2, VDR_Q2_0_Q8_1_MMVQ,
                      vec_dot_q2_0_q8_1)
+MMVQ_PLAIN_BATCH_SET(iq3xxs, block_iq3_xxs, QK_K, QI3_XXS, VDR_IQ3_XXS_Q8_1_MMVQ,
+                     vec_dot_iq3_xxs_q8_1)
 
 #define MMVQ_FUSED_GLU_TYPE_SET(tag, block_q_t, qk_val, qi_val, vdr_val,       \
                                 vec_dot)                                       \
@@ -1317,6 +1407,8 @@ MMVQ_FUSED_GLU_TYPE_SET(iq4nl, block_iq4_nl, QK4_NL, 1,
                         VDR_IQ4_NL_Q8_1_MMVQ, vec_dot_iq4_nl_q8_1)
 MMVQ_FUSED_GLU_TYPE_SET(q2_0, block_q2_0, QK2_0, 2,
                         VDR_Q2_0_Q8_1_MMVQ, vec_dot_q2_0_q8_1)
+MMVQ_FUSED_GLU_TYPE_SET(iq3xxs, block_iq3_xxs, QK_K, QI3_XXS,
+                        VDR_IQ3_XXS_Q8_1_MMVQ, vec_dot_iq3_xxs_q8_1)
 
 #define MMVQ_FUSED_QKV_TYPE_SET(tag, block_q_t, qk_val, qi_val, vdr_val,       \
                                 vec_dot)                                       \
@@ -1353,6 +1445,8 @@ MMVQ_FUSED_QKV_TYPE_SET(iq4nl, block_iq4_nl, QK4_NL, 1,
                         VDR_IQ4_NL_Q8_1_MMVQ, vec_dot_iq4_nl_q8_1)
 MMVQ_FUSED_QKV_TYPE_SET(q2_0, block_q2_0, QK2_0, 2,
                         VDR_Q2_0_Q8_1_MMVQ, vec_dot_q2_0_q8_1)
+MMVQ_FUSED_QKV_TYPE_SET(iq3xxs, block_iq3_xxs, QK_K, QI3_XXS,
+                        VDR_IQ3_XXS_Q8_1_MMVQ, vec_dot_iq3_xxs_q8_1)
 
 // Padding-aware BF16/F16/F32 -> Q8_1 quantize kernels.
 
@@ -1688,6 +1782,7 @@ MMVQ_LAUNCHER_PLAIN(q6_k, bf16, __nv_bfloat16)
 MMVQ_LAUNCHER_PLAIN(iq4xs, bf16, __nv_bfloat16)
 MMVQ_LAUNCHER_PLAIN(iq4nl, bf16, __nv_bfloat16)
 MMVQ_LAUNCHER_PLAIN(q2_0, bf16, __nv_bfloat16)
+MMVQ_LAUNCHER_PLAIN(iq3xxs, bf16, __nv_bfloat16)
 
 MMVQ_LAUNCHER_PLAIN(q4_0, f16, half)
 MMVQ_LAUNCHER_PLAIN(q4_1, f16, half)
@@ -1702,6 +1797,7 @@ MMVQ_LAUNCHER_PLAIN(q6_k, f16, half)
 MMVQ_LAUNCHER_PLAIN(iq4xs, f16, half)
 MMVQ_LAUNCHER_PLAIN(iq4nl, f16, half)
 MMVQ_LAUNCHER_PLAIN(q2_0, f16, half)
+MMVQ_LAUNCHER_PLAIN(iq3xxs, f16, half)
 
 MMVQ_LAUNCHER_PLAIN(q4_0, f32, float)
 MMVQ_LAUNCHER_PLAIN(q4_1, f32, float)
@@ -1716,6 +1812,7 @@ MMVQ_LAUNCHER_PLAIN(q6_k, f32, float)
 MMVQ_LAUNCHER_PLAIN(iq4xs, f32, float)
 MMVQ_LAUNCHER_PLAIN(iq4nl, f32, float)
 MMVQ_LAUNCHER_PLAIN(q2_0, f32, float)
+MMVQ_LAUNCHER_PLAIN(iq3xxs, f32, float)
 
 #define MMVQ_LAUNCHER_FUSED_GLU_TYPE_SET(tag)                                  \
   MMVQ_LAUNCHER_FUSED_GLU(tag, bf16, __nv_bfloat16)                            \
@@ -1735,6 +1832,7 @@ MMVQ_LAUNCHER_FUSED_GLU_TYPE_SET(q6_k)
 MMVQ_LAUNCHER_FUSED_GLU_TYPE_SET(iq4xs)
 MMVQ_LAUNCHER_FUSED_GLU_TYPE_SET(iq4nl)
 MMVQ_LAUNCHER_FUSED_GLU_TYPE_SET(q2_0)
+MMVQ_LAUNCHER_FUSED_GLU_TYPE_SET(iq3xxs)
 
 #define MMVQ_LAUNCHER_FUSED_QKV_TYPE_SET(tag)                                  \
   MMVQ_LAUNCHER_FUSED_QKV(tag, bf16, __nv_bfloat16)                            \
@@ -1754,6 +1852,7 @@ MMVQ_LAUNCHER_FUSED_QKV_TYPE_SET(q6_k)
 MMVQ_LAUNCHER_FUSED_QKV_TYPE_SET(iq4xs)
 MMVQ_LAUNCHER_FUSED_QKV_TYPE_SET(iq4nl)
 MMVQ_LAUNCHER_FUSED_QKV_TYPE_SET(q2_0)
+MMVQ_LAUNCHER_FUSED_QKV_TYPE_SET(iq3xxs)
 
 // Quantize launchers.
 

@@ -95,6 +95,7 @@ pub fn qtensor_indexed_moe_forward(
 fn routed_gemv(qtensor: &QTensor, x: &Tensor, ids: &Tensor) -> Result<Option<Tensor>> {
     use candle_core::quantized::{k_quants::*, GgmlDType};
 
+    use super::iq3xxs::BlockIQ3XXS;
     use super::iq4nl::BlockIQ4NL;
     use super::iq4xs::BlockIQ4XS;
     use super::q2_0::BlockQ2_0;
@@ -140,6 +141,7 @@ fn routed_gemv(qtensor: &QTensor, x: &Tensor, ids: &Tensor) -> Result<Option<Ten
         GgmlDType::IQ4XS => gemv::<BlockIQ4XS>(&data, &xs, &ids, (tokens, x_t, topk, n, k))?,
         GgmlDType::IQ4NL => gemv::<BlockIQ4NL>(&data, &xs, &ids, (tokens, x_t, topk, n, k))?,
         GgmlDType::Q2_0 => gemv::<BlockQ2_0>(&data, &xs, &ids, (tokens, x_t, topk, n, k))?,
+        GgmlDType::IQ3_XXS => gemv::<BlockIQ3XXS>(&data, &xs, &ids, (tokens, x_t, topk, n, k))?,
         _ => return Ok(None),
     };
     let out = Tensor::from_vec(dst, (tokens, topk, n), x.device())?;

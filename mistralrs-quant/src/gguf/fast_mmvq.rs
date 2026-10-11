@@ -49,6 +49,7 @@ pub fn supports(dtype: GgmlDType) -> bool {
             | GgmlDType::IQ4XS
             | GgmlDType::IQ4NL
             | GgmlDType::Q2_0
+            | GgmlDType::IQ3_XXS
     )
 }
 
@@ -174,6 +175,7 @@ fn plain_launcher_bf16(dtype: GgmlDType) -> Option<PlainLauncher> {
         GgmlDType::IQ4XS => ffi::launch_mmvq_gguf_iq4xs_bf16_plain,
         GgmlDType::IQ4NL => ffi::launch_mmvq_gguf_iq4nl_bf16_plain,
         GgmlDType::Q2_0 => ffi::launch_mmvq_gguf_q2_0_bf16_plain,
+        GgmlDType::IQ3_XXS => ffi::launch_mmvq_gguf_iq3xxs_bf16_plain,
         _ => return None,
     };
     Some(f)
@@ -194,6 +196,7 @@ fn plain_launcher_f16(dtype: GgmlDType) -> Option<PlainLauncher> {
         GgmlDType::IQ4XS => ffi::launch_mmvq_gguf_iq4xs_f16_plain,
         GgmlDType::IQ4NL => ffi::launch_mmvq_gguf_iq4nl_f16_plain,
         GgmlDType::Q2_0 => ffi::launch_mmvq_gguf_q2_0_f16_plain,
+        GgmlDType::IQ3_XXS => ffi::launch_mmvq_gguf_iq3xxs_f16_plain,
         _ => return None,
     };
     Some(f)
@@ -214,6 +217,7 @@ fn plain_launcher_f32(dtype: GgmlDType) -> Option<PlainLauncher> {
         GgmlDType::IQ4XS => ffi::launch_mmvq_gguf_iq4xs_f32_plain,
         GgmlDType::IQ4NL => ffi::launch_mmvq_gguf_iq4nl_f32_plain,
         GgmlDType::Q2_0 => ffi::launch_mmvq_gguf_q2_0_f32_plain,
+        GgmlDType::IQ3_XXS => ffi::launch_mmvq_gguf_iq3xxs_f32_plain,
         _ => return None,
     };
     Some(f)
@@ -234,6 +238,7 @@ fn fused_glu_launcher(input_ty: DType, dtype: GgmlDType) -> Option<FusedGluLaunc
         (DType::BF16, GgmlDType::IQ4XS) => Some(ffi::launch_mmvq_gguf_iq4xs_bf16_fused_glu),
         (DType::BF16, GgmlDType::IQ4NL) => Some(ffi::launch_mmvq_gguf_iq4nl_bf16_fused_glu),
         (DType::BF16, GgmlDType::Q2_0) => Some(ffi::launch_mmvq_gguf_q2_0_bf16_fused_glu),
+        (DType::BF16, GgmlDType::IQ3_XXS) => Some(ffi::launch_mmvq_gguf_iq3xxs_bf16_fused_glu),
 
         (DType::F16, GgmlDType::Q4_0) => Some(ffi::launch_mmvq_gguf_q4_0_f16_fused_glu),
         (DType::F16, GgmlDType::Q4_1) => Some(ffi::launch_mmvq_gguf_q4_1_f16_fused_glu),
@@ -248,6 +253,7 @@ fn fused_glu_launcher(input_ty: DType, dtype: GgmlDType) -> Option<FusedGluLaunc
         (DType::F16, GgmlDType::IQ4XS) => Some(ffi::launch_mmvq_gguf_iq4xs_f16_fused_glu),
         (DType::F16, GgmlDType::IQ4NL) => Some(ffi::launch_mmvq_gguf_iq4nl_f16_fused_glu),
         (DType::F16, GgmlDType::Q2_0) => Some(ffi::launch_mmvq_gguf_q2_0_f16_fused_glu),
+        (DType::F16, GgmlDType::IQ3_XXS) => Some(ffi::launch_mmvq_gguf_iq3xxs_f16_fused_glu),
 
         (DType::F32, GgmlDType::Q4_0) => Some(ffi::launch_mmvq_gguf_q4_0_f32_fused_glu),
         (DType::F32, GgmlDType::Q4_1) => Some(ffi::launch_mmvq_gguf_q4_1_f32_fused_glu),
@@ -262,6 +268,7 @@ fn fused_glu_launcher(input_ty: DType, dtype: GgmlDType) -> Option<FusedGluLaunc
         (DType::F32, GgmlDType::IQ4XS) => Some(ffi::launch_mmvq_gguf_iq4xs_f32_fused_glu),
         (DType::F32, GgmlDType::IQ4NL) => Some(ffi::launch_mmvq_gguf_iq4nl_f32_fused_glu),
         (DType::F32, GgmlDType::Q2_0) => Some(ffi::launch_mmvq_gguf_q2_0_f32_fused_glu),
+        (DType::F32, GgmlDType::IQ3_XXS) => Some(ffi::launch_mmvq_gguf_iq3xxs_f32_fused_glu),
         _ => None,
     }
 }
@@ -285,6 +292,7 @@ fn fused_qkv_launcher(input_ty: DType, dtype: GgmlDType) -> Option<FusedQkvLaunc
         (DType::BF16, GgmlDType::IQ4XS) => Some(ffi::launch_mmvq_gguf_iq4xs_bf16_fused_qkv),
         (DType::BF16, GgmlDType::IQ4NL) => Some(ffi::launch_mmvq_gguf_iq4nl_bf16_fused_qkv),
         (DType::BF16, GgmlDType::Q2_0) => Some(ffi::launch_mmvq_gguf_q2_0_bf16_fused_qkv),
+        (DType::BF16, GgmlDType::IQ3_XXS) => Some(ffi::launch_mmvq_gguf_iq3xxs_bf16_fused_qkv),
 
         (DType::F16, GgmlDType::Q4_0) => Some(ffi::launch_mmvq_gguf_q4_0_f16_fused_qkv),
         (DType::F16, GgmlDType::Q4_1) => Some(ffi::launch_mmvq_gguf_q4_1_f16_fused_qkv),
@@ -299,6 +307,7 @@ fn fused_qkv_launcher(input_ty: DType, dtype: GgmlDType) -> Option<FusedQkvLaunc
         (DType::F16, GgmlDType::IQ4XS) => Some(ffi::launch_mmvq_gguf_iq4xs_f16_fused_qkv),
         (DType::F16, GgmlDType::IQ4NL) => Some(ffi::launch_mmvq_gguf_iq4nl_f16_fused_qkv),
         (DType::F16, GgmlDType::Q2_0) => Some(ffi::launch_mmvq_gguf_q2_0_f16_fused_qkv),
+        (DType::F16, GgmlDType::IQ3_XXS) => Some(ffi::launch_mmvq_gguf_iq3xxs_f16_fused_qkv),
 
         (DType::F32, GgmlDType::Q4_0) => Some(ffi::launch_mmvq_gguf_q4_0_f32_fused_qkv),
         (DType::F32, GgmlDType::Q4_1) => Some(ffi::launch_mmvq_gguf_q4_1_f32_fused_qkv),
@@ -313,6 +322,7 @@ fn fused_qkv_launcher(input_ty: DType, dtype: GgmlDType) -> Option<FusedQkvLaunc
         (DType::F32, GgmlDType::IQ4XS) => Some(ffi::launch_mmvq_gguf_iq4xs_f32_fused_qkv),
         (DType::F32, GgmlDType::IQ4NL) => Some(ffi::launch_mmvq_gguf_iq4nl_f32_fused_qkv),
         (DType::F32, GgmlDType::Q2_0) => Some(ffi::launch_mmvq_gguf_q2_0_f32_fused_qkv),
+        (DType::F32, GgmlDType::IQ3_XXS) => Some(ffi::launch_mmvq_gguf_iq3xxs_f32_fused_qkv),
         _ => None,
     }
 }
