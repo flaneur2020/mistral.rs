@@ -12,6 +12,7 @@ pub mod iq4nl;
 pub mod iq4xs;
 #[cfg(all(feature = "cuda", has_marlin_kernels))]
 mod packed_affine;
+pub mod q2_0;
 mod weight_source;
 
 pub use weight_source::{
@@ -71,6 +72,7 @@ fn ggml_dtype_to_uqff_code(dtype: GgmlDType) -> u32 {
         GgmlDType::Q8K => 15,
         GgmlDType::IQ4NL => 20,
         GgmlDType::IQ4XS => 23,
+        GgmlDType::Q2_0 => 42,
         GgmlDType::BF16 => 30,
     }
 }
@@ -93,6 +95,7 @@ fn ggml_dtype_from_uqff_code(dtype: u32) -> Result<GgmlDType> {
         15 => Ok(GgmlDType::Q8K),
         20 => Ok(GgmlDType::IQ4NL),
         23 => Ok(GgmlDType::IQ4XS),
+        42 => Ok(GgmlDType::Q2_0),
         30 => Ok(GgmlDType::BF16),
         _ => candle_core::bail!("unknown dtype for quantized weight tensor {dtype}"),
     }
@@ -116,6 +119,7 @@ fn gguf_dtype_label(dtype: u32) -> String {
         15 => "q8k",
         20 => "iq4nl",
         23 => "iq4xs",
+        42 => "q2_0",
         30 => "bf16",
         _ => "unknown",
     }

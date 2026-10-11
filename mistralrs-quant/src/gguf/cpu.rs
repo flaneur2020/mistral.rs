@@ -97,6 +97,7 @@ fn routed_gemv(qtensor: &QTensor, x: &Tensor, ids: &Tensor) -> Result<Option<Ten
 
     use super::iq4nl::BlockIQ4NL;
     use super::iq4xs::BlockIQ4XS;
+    use super::q2_0::BlockQ2_0;
 
     if !x.device().is_cpu() || !qtensor.device().is_cpu() {
         return Ok(None);
@@ -138,6 +139,7 @@ fn routed_gemv(qtensor: &QTensor, x: &Tensor, ids: &Tensor) -> Result<Option<Ten
         GgmlDType::Q6K => gemv::<BlockQ6K>(&data, &xs, &ids, (tokens, x_t, topk, n, k))?,
         GgmlDType::IQ4XS => gemv::<BlockIQ4XS>(&data, &xs, &ids, (tokens, x_t, topk, n, k))?,
         GgmlDType::IQ4NL => gemv::<BlockIQ4NL>(&data, &xs, &ids, (tokens, x_t, topk, n, k))?,
+        GgmlDType::Q2_0 => gemv::<BlockQ2_0>(&data, &xs, &ids, (tokens, x_t, topk, n, k))?,
         _ => return Ok(None),
     };
     let out = Tensor::from_vec(dst, (tokens, topk, n), x.device())?;

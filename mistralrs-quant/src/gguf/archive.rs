@@ -24,6 +24,7 @@ use memmap2::{Mmap, MmapOptions};
 
 use super::iq4nl::{self, BlockIQ4NL};
 use super::iq4xs::{self, BlockIQ4XS};
+use super::q2_0::{self, BlockQ2_0};
 
 const DEFAULT_ALIGNMENT: usize = 32;
 const MAX_STRING_LENGTH: u64 = 1 << 30;
@@ -180,6 +181,7 @@ impl GgufDType {
             15 => GgmlDType::Q8K,
             20 => GgmlDType::IQ4NL,
             23 => GgmlDType::IQ4XS,
+            42 => GgmlDType::Q2_0,
             30 => GgmlDType::BF16,
             raw => candle_core::bail!("GGUF dtype {raw} is not supported by Candle"),
         };
@@ -604,12 +606,13 @@ pub(super) fn qtensor_from_gguf_data(
             data.len()
         );
     }
-    let storage = if matches!(dtype, GgmlDType::IQ4XS | GgmlDType::IQ4NL) {
+    let storage = if matches!(dtype, GgmlDType::IQ4XS | GgmlDType::IQ4NL | GgmlDType::Q2_0) {
         // candle-core has no block type for these, so its own storage is a stub;
         // build the storage in the type's own module instead.
         match dtype {
             GgmlDType::IQ4XS => iq4xs::storage_for_device(data, device)?,
             GgmlDType::IQ4NL => iq4nl::storage_for_device(data, device)?,
+            GgmlDType::Q2_0 => q2_0::storage_for_device(data, device)?,
             _ => unreachable!(),
         }
     } else if data.as_ptr().align_offset(ggml_dtype_alignment(dtype)) == 0 {
@@ -641,6 +644,7 @@ const fn ggml_dtype_alignment(dtype: GgmlDType) -> usize {
         GgmlDType::Q8K => align_of::<BlockQ8K>(),
         GgmlDType::IQ4XS => align_of::<BlockIQ4XS>(),
         GgmlDType::IQ4NL => align_of::<BlockIQ4NL>(),
+        GgmlDType::Q2_0 => align_of::<BlockQ2_0>(),
         GgmlDType::BF16 => align_of::<bf16>(),
     }
 }

@@ -175,6 +175,13 @@ typedef struct {
   uint8_t qs[QK4_NL / 2];
 } block_iq4_nl;
 
+// Q2_0 (GGML type 42): one f16 scale, 16 bytes of two-bit codes.
+#define QK2_0 64
+typedef struct {
+  half d;
+  uint8_t qs[QK2_0 / 4];
+} block_q2_0;
+
 // Q4_0 block type
 #define QK4_0 32
 #define QR4_0 2
@@ -227,6 +234,7 @@ typedef struct {
 #define VDR_Q6_K_Q8_1_MMVQ 1
 #define VDR_IQ4_XS_Q8_1_MMVQ 1
 #define VDR_IQ4_NL_Q8_1_MMVQ 1
+#define VDR_Q2_0_Q8_1_MMVQ 1
 
 // vec_dot implementations for Q4_0, Q4_1, Q5_0, Q5_1
 
@@ -692,6 +700,26 @@ vec_dot_iq4_nl_q8_1(const void *__restrict__ vbq,
   return __half2float(bq4->d) * __low2float(bq8_1->ds) * sumi;
 }
 
+// Q2_0: one 32-element chunk per call, `iqs` selects the chunk (0/1).
+static __device__ __forceinline__ float
+vec_dot_q2_0_q8_1(const void *__restrict__ vbq,
+                  const block_q8_1 *__restrict__ bq8_1, const int &iqs) {
+  const block_q2_0 *bq2 = (const block_q2_0 *)vbq;
+  const uint8_t *qs = bq2->qs + iqs * 8;
+  const block_q8_1 *chunk = bq8_1 + iqs;
+  const int8_t *qy = chunk->qs;
+  int sumi = 0;
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    const int byte = qs[j];
+    sumi += (((byte >> 0) & 3) - 1) * (int)qy[j * 4 + 0];
+    sumi += (((byte >> 2) & 3) - 1) * (int)qy[j * 4 + 1];
+    sumi += (((byte >> 4) & 3) - 1) * (int)qy[j * 4 + 2];
+    sumi += (((byte >> 6) & 3) - 1) * (int)qy[j * 4 + 3];
+  }
+  return __half2float(bq2->d) * __low2float(chunk->ds) * sumi;
+}
+
 static __device__ __forceinline__ float
 vec_dot_q5_K_q8_1(const void *__restrict__ vbq,
                   const block_q8_1 *__restrict__ bq8_1, const int &iqs) {
@@ -1117,6 +1145,18 @@ extern "C" __global__ void indexed_moe_forward_iq4nl_q8_1(
                                            k_padded, input_dim1);
 }
 
+// Q2_0: qi = 2 (two 32-element chunks per 64-element block), vdr = 1.
+extern "C" __global__ void indexed_moe_forward_q2_0_q8_1(
+    const void *__restrict__ all_weights, const void *__restrict__ all_inputs,
+    const unsigned int *__restrict__ indices, float *__restrict__ all_outputs,
+    const int n, const int k, const int batch, const int topk,
+    const int k_padded, const int input_dim1) {
+  indexed_moe_forward<QK2_0, 2, block_q2_0, VDR_Q2_0_Q8_1_MMVQ,
+                      vec_dot_q2_0_q8_1>(all_weights, all_inputs, indices,
+                                         all_outputs, n, k, batch, topk,
+                                         k_padded, input_dim1);
+}
+
 extern "C" __global__ void indexed_moe_forward_q8_0_q8_1(
     const void *__restrict__ all_weights, const void *__restrict__ all_inputs,
     const unsigned int *__restrict__ indices, float *__restrict__ all_outputs,
@@ -1219,6 +1259,18 @@ extern "C" void launch_indexed_moe_forward_iq4nl_q8_1(
   dim3 block(WARP_SIZE, 4, 1);
   cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
   indexed_moe_forward_iq4nl_q8_1<<<grid, block, 0, cuda_stream>>>(
+      all_weights, all_inputs, indices, all_outputs, n, k, batch, topk,
+      k_padded, input_dim1);
+}
+
+extern "C" void launch_indexed_moe_forward_q2_0_q8_1(
+    const void *all_weights, const void *all_inputs,
+    const unsigned int *indices, float *all_outputs, int n, int k, int batch,
+    int topk, int k_padded, int input_dim1, void *stream) {
+  dim3 grid(n, batch, topk);
+  dim3 block(WARP_SIZE, 4, 1);
+  cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+  indexed_moe_forward_q2_0_q8_1<<<grid, block, 0, cuda_stream>>>(
       all_weights, all_inputs, indices, all_outputs, n, k, batch, topk,
       k_padded, input_dim1);
 }
@@ -1669,6 +1721,8 @@ FUSED_GATE_UP_KERNEL(iq4xs_q8_1, QK_K, 8, block_iq4_xs,
                      VDR_IQ4_XS_Q8_1_MMVQ, vec_dot_iq4_xs_q8_1)
 FUSED_GATE_UP_KERNEL(iq4nl_q8_1, QK4_NL, 1, block_iq4_nl,
                      VDR_IQ4_NL_Q8_1_MMVQ, vec_dot_iq4_nl_q8_1)
+FUSED_GATE_UP_KERNEL(q2_0_q8_1, QK2_0, 2, block_q2_0,
+                     VDR_Q2_0_Q8_1_MMVQ, vec_dot_q2_0_q8_1)
 
 #define LORA_DECODE_KERNELS(suffix, qk_val, qi_val, block_type, vdr_val,       \
                             vd_fn)                                             \
@@ -1761,6 +1815,8 @@ DOWN_AGGREGATE_KERNEL(iq4xs_q8_1, QK_K, 8, block_iq4_xs,
                       VDR_IQ4_XS_Q8_1_MMVQ, vec_dot_iq4_xs_q8_1)
 DOWN_AGGREGATE_KERNEL(iq4nl_q8_1, QK4_NL, 1, block_iq4_nl,
                       VDR_IQ4_NL_Q8_1_MMVQ, vec_dot_iq4_nl_q8_1)
+DOWN_AGGREGATE_KERNEL(q2_0_q8_1, QK2_0, 2, block_q2_0,
+                      VDR_Q2_0_Q8_1_MMVQ, vec_dot_q2_0_q8_1)
 
 // ============== Fused gate+up launcher functions ==============
 
@@ -1794,6 +1850,7 @@ LAUNCH_FUSED_GATE_UP(q5k_q8_1)
 LAUNCH_FUSED_GATE_UP(q6k_q8_1)
 LAUNCH_FUSED_GATE_UP(iq4xs_q8_1)
 LAUNCH_FUSED_GATE_UP(iq4nl_q8_1)
+LAUNCH_FUSED_GATE_UP(q2_0_q8_1)
 
 #define LAUNCH_LORA_DECODE(suffix)                                             \
   extern "C" int launch_moe_gemv_gate_up_pair_##suffix(                        \
@@ -1877,3 +1934,4 @@ LAUNCH_DOWN_AGGREGATE(q5k_q8_1)
 LAUNCH_DOWN_AGGREGATE(q6k_q8_1)
 LAUNCH_DOWN_AGGREGATE(iq4xs_q8_1)
 LAUNCH_DOWN_AGGREGATE(iq4nl_q8_1)
+LAUNCH_DOWN_AGGREGATE(q2_0_q8_1)

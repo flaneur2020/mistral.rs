@@ -201,6 +201,13 @@ typedef struct {
   uint8_t qs[QK4_NL / 2];
 } block_iq4_nl;
 
+// Q2_0 (GGML type 42): one f16 scale, 16 bytes of two-bit codes.
+#define QK2_0 64
+typedef struct {
+  half d;
+  uint8_t qs[QK2_0 / 4];
+} block_q2_0;
+
 // VDR constants (same as indexed_moe)
 #define VDR_Q4_0_Q8_1_MMVQ 2
 #define VDR_Q4_1_Q8_1_MMVQ 2
@@ -215,6 +222,7 @@ typedef struct {
 #define VDR_Q6_K_Q8_1_MMVQ 1
 #define VDR_IQ4_XS_Q8_1_MMVQ 1
 #define VDR_IQ4_NL_Q8_1_MMVQ 1
+#define VDR_Q2_0_Q8_1_MMVQ 1
 
 // ============== vec_dot implementations ==============
 
@@ -706,6 +714,26 @@ vd_iq4nl_q8_1(const void *__restrict__ vbq,
   return __half2float(bq4->d) * __low2float(bq8_1->ds) * sumi;
 }
 
+// Q2_0: one 32-element chunk per call, `iqs` selects the chunk (0/1).
+static __device__ __forceinline__ float
+vd_q2_0_q8_1(const void *__restrict__ vbq,
+             const block_q8_1 *__restrict__ bq8_1, const int &iqs) {
+  const block_q2_0 *bq2 = (const block_q2_0 *)vbq;
+  const uint8_t *qs = bq2->qs + iqs * 8;
+  const block_q8_1 *chunk = bq8_1 + iqs;
+  const int8_t *qy = chunk->qs;
+  int sumi = 0;
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    const int byte = qs[j];
+    sumi += (((byte >> 0) & 3) - 1) * (int)qy[j * 4 + 0];
+    sumi += (((byte >> 2) & 3) - 1) * (int)qy[j * 4 + 1];
+    sumi += (((byte >> 4) & 3) - 1) * (int)qy[j * 4 + 2];
+    sumi += (((byte >> 6) & 3) - 1) * (int)qy[j * 4 + 3];
+  }
+  return __half2float(bq2->d) * __low2float(chunk->ds) * sumi;
+}
+
 // ============== Dispatch kernels ==============
 
 // Phase 1: Count tokens per expert using atomics
@@ -1183,6 +1211,8 @@ MOE_KERNEL_INST(iq4xs, QK_K, QI4_XS, block_iq4_xs, VDR_IQ4_XS_Q8_1_MMVQ,
                 vd_iq4xs_q8_1, K_TILE_BLOCKS_SMALL)
 MOE_KERNEL_INST(iq4nl, QK4_NL, 1, block_iq4_nl, VDR_IQ4_NL_Q8_1_MMVQ,
                 vd_iq4nl_q8_1, K_TILE_BLOCKS_LARGE)
+MOE_KERNEL_INST(q2_0, QK2_0, 2, block_q2_0, VDR_Q2_0_Q8_1_MMVQ,
+                vd_q2_0_q8_1, 4)
 
 // ============== C wrapper functions for FFI ==============
 
@@ -1319,3 +1349,4 @@ LAUNCH_MOE_TILED_GEMM(q5k, block_q5_K, QK_K, K_TILE_BLOCKS_SMALL)
 LAUNCH_MOE_TILED_GEMM(q6k, block_q6_K, QK_K, K_TILE_BLOCKS_SMALL)
 LAUNCH_MOE_TILED_GEMM(iq4xs, block_iq4_xs, QK_K, K_TILE_BLOCKS_SMALL)
 LAUNCH_MOE_TILED_GEMM(iq4nl, block_iq4_nl, QK4_NL, K_TILE_BLOCKS_LARGE)
+LAUNCH_MOE_TILED_GEMM(q2_0, block_q2_0, QK2_0, 4)

@@ -13,9 +13,12 @@ the `GgmlDType` variant (see below); the loader builds the storage with
 | --- | ---: | --- | --- | --- | --- |
 | IQ4_XS | 23 | 256 el / 136 B | Q8_K | scalar + AVX2 | `indexed_moe`, `mmvq_gguf`, `moe_grouped`, `mmq_gguf` |
 | IQ4_NL | 20 | 32 el / 18 B | Q8_0 | scalar + AVX2 | `indexed_moe`, `mmvq_gguf`, `moe_grouped`, `mmq_gguf` |
+| Q2_0 | 42 | 64 el / 18 B | Q8_0 (2 per block) | scalar | `indexed_moe`, `mmvq_gguf`, `moe_grouped` |
 
-Each has: an oracle generated from ggml (`tools/iq4xs`, `tools/iq4nl`), CPU
-oracle tests, and CUDA tests that compare every kernel against the CPU kernel.
+Each has: an oracle generated from ggml (`tools/iq4xs`, `tools/iq4nl`,
+`tools/q2_0`), CPU oracle tests, and CUDA tests that compare every kernel
+against the CPU kernel. Q2_0 has no MMQ kernel (dense batches over 8 chunk
+through MMVQ) and no SIMD dot (ggml has none either).
 
 ## Remaining for the Coder GGUF
 
@@ -26,7 +29,6 @@ From a census of shard 1 (1223 tensors); the routed experts use a mix:
 | IQ2_S | 22 | 40 exps | next (most experts) |
 | IQ3_XXS | 18 | 34 exps | grid codebooks |
 | IQ3_S | 21 | 20 exps | grid codebooks |
-| Q2_0 | 42 | 9 exps | Strata has a bitplane kernel |
 
 The PLE n-gram table is IQ4_NL and is read directly by the fork, so it needs no
 candle support.
@@ -73,7 +75,10 @@ NVFP4 (40). Each is the same shape of work as below.
 - A `block_iq4_nl`'s `qs` sits at byte offset 2, so the CUDA code must use the
   2-byte-safe `get_int_from_uint8`, not the 4-byte `..._aligned` variant (the
   latter faults with `CUDA_ERROR_MISALIGNED_ADDRESS`). `block_iq4_xs::qs` is at
-  offset 8 and is fine either way.
+  offset 8 and is fine either way; `block_q2_0::qs` is read byte-wise.
+- Q2_0 has no MMQ path in the fork's `mmq_gguf` headers, so `fast_mmq` must not
+  claim it (`supports(Q2_0)` stays false); the dense prompt path uses
+  `GgufMatMul::mmvq_chunked`.
 - `supports_mmq(dtype)` being true makes the MoE prefill use the MMQ pair path;
   `grouped_moe_gemm_prequantized` (`moe_grouped.cu`) is the fallback and is also
   wired and tested.
