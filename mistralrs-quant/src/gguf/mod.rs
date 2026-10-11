@@ -8,6 +8,7 @@ pub mod fast_mmq;
 pub mod fast_mmvq;
 #[cfg(feature = "cuda")]
 mod ffi;
+pub mod iq4nl;
 pub mod iq4xs;
 #[cfg(all(feature = "cuda", has_marlin_kernels))]
 mod packed_affine;
@@ -68,6 +69,7 @@ fn ggml_dtype_to_uqff_code(dtype: GgmlDType) -> u32 {
         GgmlDType::Q5K => 13,
         GgmlDType::Q6K => 14,
         GgmlDType::Q8K => 15,
+        GgmlDType::IQ4NL => 20,
         GgmlDType::IQ4XS => 23,
         GgmlDType::BF16 => 30,
     }
@@ -89,6 +91,7 @@ fn ggml_dtype_from_uqff_code(dtype: u32) -> Result<GgmlDType> {
         13 => Ok(GgmlDType::Q5K),
         14 => Ok(GgmlDType::Q6K),
         15 => Ok(GgmlDType::Q8K),
+        20 => Ok(GgmlDType::IQ4NL),
         23 => Ok(GgmlDType::IQ4XS),
         30 => Ok(GgmlDType::BF16),
         _ => candle_core::bail!("unknown dtype for quantized weight tensor {dtype}"),
@@ -111,6 +114,7 @@ fn gguf_dtype_label(dtype: u32) -> String {
         13 => "q5k",
         14 => "q6k",
         15 => "q8k",
+        20 => "iq4nl",
         23 => "iq4xs",
         30 => "bf16",
         _ => "unknown",

@@ -223,6 +223,13 @@ typedef struct {
   uint8_t qs[QK_K / 2];
 } block_iq4_xs;
 
+// IQ4_NL (GGML type 20): one f16 scale and 16 bytes of nibbles.
+#define QK4_NL 32
+typedef struct {
+  half d;
+  uint8_t qs[QK4_NL / 2];
+} block_iq4_nl;
+
 #define QK4_0 32
 #define QR4_0 2
 #define QI4_0 (QK4_0 / (4 * QR4_0))
@@ -270,6 +277,7 @@ typedef struct {
 #define VDR_Q5_K_Q8_1_MMVQ 2
 #define VDR_Q6_K_Q8_1_MMVQ 1
 #define VDR_IQ4_XS_Q8_1_MMVQ 1
+#define VDR_IQ4_NL_Q8_1_MMVQ 1
 
 // ---------------------------------------------------------------------------
 // vec_dot impl helpers (per-quant-type)
@@ -679,6 +687,26 @@ vec_dot_iq4_xs_q8_1(const void *__restrict__ vbq,
 
   const float d = __half2float(bq4->d) * __low2float(bq8_1[iqs].ds);
   return d * sumi;
+}
+
+// IQ4_NL: the whole 32-element block per call (qi = vdr = 1), `iqs` is 0.
+static __device__ __forceinline__ float
+vec_dot_iq4_nl_q8_1(const void *__restrict__ vbq,
+                    const block_q8_1 *__restrict__ bq8_1, const int &kbx,
+                    const int &iqs) {
+  (void)iqs;
+  const block_iq4_nl *bq4 = (const block_iq4_nl *)vbq + kbx;
+  int sumi = 0;
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const int aux_q4 = get_int_from_uint8(bq4->qs, j);
+    const int2 v = get_int_from_table_16(aux_q4, kvalues_iq4nl);
+    const int u0 = get_int_from_int8_aligned(bq8_1->qs, j + 0);
+    const int u1 = get_int_from_int8_aligned(bq8_1->qs, j + 4);
+    sumi = ggml_cuda_dp4a(v.x, u0, sumi);
+    sumi = ggml_cuda_dp4a(v.y, u1, sumi);
+  }
+  return __half2float(bq4->d) * __low2float(bq8_1->ds) * sumi;
 }
 
 static __device__ __forceinline__ float
@@ -1220,6 +1248,8 @@ MMVQ_PLAIN_BATCH_SET(q6_k, block_q6_K, QK_K, QI6_K, VDR_Q6_K_Q8_1_MMVQ,
                      vec_dot_q6_K_q8_1)
 MMVQ_PLAIN_BATCH_SET(iq4xs, block_iq4_xs, QK_K, QI4_XS, VDR_IQ4_XS_Q8_1_MMVQ,
                      vec_dot_iq4_xs_q8_1)
+MMVQ_PLAIN_BATCH_SET(iq4nl, block_iq4_nl, QK4_NL, 1, VDR_IQ4_NL_Q8_1_MMVQ,
+                     vec_dot_iq4_nl_q8_1)
 
 #define MMVQ_FUSED_GLU_TYPE_SET(tag, block_q_t, qk_val, qi_val, vdr_val,       \
                                 vec_dot)                                       \
@@ -1252,6 +1282,8 @@ MMVQ_FUSED_GLU_TYPE_SET(q6_k, block_q6_K, QK_K, QI6_K, VDR_Q6_K_Q8_1_MMVQ,
                         vec_dot_q6_K_q8_1)
 MMVQ_FUSED_GLU_TYPE_SET(iq4xs, block_iq4_xs, QK_K, QI4_XS,
                         VDR_IQ4_XS_Q8_1_MMVQ, vec_dot_iq4_xs_q8_1)
+MMVQ_FUSED_GLU_TYPE_SET(iq4nl, block_iq4_nl, QK4_NL, 1,
+                        VDR_IQ4_NL_Q8_1_MMVQ, vec_dot_iq4_nl_q8_1)
 
 #define MMVQ_FUSED_QKV_TYPE_SET(tag, block_q_t, qk_val, qi_val, vdr_val,       \
                                 vec_dot)                                       \
@@ -1284,6 +1316,8 @@ MMVQ_FUSED_QKV_TYPE_SET(q6_k, block_q6_K, QK_K, QI6_K, VDR_Q6_K_Q8_1_MMVQ,
                         vec_dot_q6_K_q8_1)
 MMVQ_FUSED_QKV_TYPE_SET(iq4xs, block_iq4_xs, QK_K, QI4_XS,
                         VDR_IQ4_XS_Q8_1_MMVQ, vec_dot_iq4_xs_q8_1)
+MMVQ_FUSED_QKV_TYPE_SET(iq4nl, block_iq4_nl, QK4_NL, 1,
+                        VDR_IQ4_NL_Q8_1_MMVQ, vec_dot_iq4_nl_q8_1)
 
 // Padding-aware BF16/F16/F32 -> Q8_1 quantize kernels.
 
@@ -1617,6 +1651,7 @@ MMVQ_LAUNCHER_PLAIN(q4_k, bf16, __nv_bfloat16)
 MMVQ_LAUNCHER_PLAIN(q5_k, bf16, __nv_bfloat16)
 MMVQ_LAUNCHER_PLAIN(q6_k, bf16, __nv_bfloat16)
 MMVQ_LAUNCHER_PLAIN(iq4xs, bf16, __nv_bfloat16)
+MMVQ_LAUNCHER_PLAIN(iq4nl, bf16, __nv_bfloat16)
 
 MMVQ_LAUNCHER_PLAIN(q4_0, f16, half)
 MMVQ_LAUNCHER_PLAIN(q4_1, f16, half)
@@ -1629,6 +1664,7 @@ MMVQ_LAUNCHER_PLAIN(q4_k, f16, half)
 MMVQ_LAUNCHER_PLAIN(q5_k, f16, half)
 MMVQ_LAUNCHER_PLAIN(q6_k, f16, half)
 MMVQ_LAUNCHER_PLAIN(iq4xs, f16, half)
+MMVQ_LAUNCHER_PLAIN(iq4nl, f16, half)
 
 MMVQ_LAUNCHER_PLAIN(q4_0, f32, float)
 MMVQ_LAUNCHER_PLAIN(q4_1, f32, float)
@@ -1641,6 +1677,7 @@ MMVQ_LAUNCHER_PLAIN(q4_k, f32, float)
 MMVQ_LAUNCHER_PLAIN(q5_k, f32, float)
 MMVQ_LAUNCHER_PLAIN(q6_k, f32, float)
 MMVQ_LAUNCHER_PLAIN(iq4xs, f32, float)
+MMVQ_LAUNCHER_PLAIN(iq4nl, f32, float)
 
 #define MMVQ_LAUNCHER_FUSED_GLU_TYPE_SET(tag)                                  \
   MMVQ_LAUNCHER_FUSED_GLU(tag, bf16, __nv_bfloat16)                            \
@@ -1658,6 +1695,7 @@ MMVQ_LAUNCHER_FUSED_GLU_TYPE_SET(q4_k)
 MMVQ_LAUNCHER_FUSED_GLU_TYPE_SET(q5_k)
 MMVQ_LAUNCHER_FUSED_GLU_TYPE_SET(q6_k)
 MMVQ_LAUNCHER_FUSED_GLU_TYPE_SET(iq4xs)
+MMVQ_LAUNCHER_FUSED_GLU_TYPE_SET(iq4nl)
 
 #define MMVQ_LAUNCHER_FUSED_QKV_TYPE_SET(tag)                                  \
   MMVQ_LAUNCHER_FUSED_QKV(tag, bf16, __nv_bfloat16)                            \
@@ -1675,6 +1713,7 @@ MMVQ_LAUNCHER_FUSED_QKV_TYPE_SET(q4_k)
 MMVQ_LAUNCHER_FUSED_QKV_TYPE_SET(q5_k)
 MMVQ_LAUNCHER_FUSED_QKV_TYPE_SET(q6_k)
 MMVQ_LAUNCHER_FUSED_QKV_TYPE_SET(iq4xs)
+MMVQ_LAUNCHER_FUSED_QKV_TYPE_SET(iq4nl)
 
 // Quantize launchers.
 

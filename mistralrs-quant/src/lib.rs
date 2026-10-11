@@ -1313,7 +1313,11 @@ impl TryFrom<GgmlDType> for IsqType {
             GgmlDType::Q8_0 => Ok(Self::Q8_0),
             GgmlDType::Q8_1 => Ok(Self::Q8_1),
             GgmlDType::Q8K => Ok(Self::Q8K),
-            GgmlDType::BF16 | GgmlDType::F32 | GgmlDType::F16 | GgmlDType::IQ4XS => {
+            GgmlDType::BF16
+            | GgmlDType::F32
+            | GgmlDType::F16
+            | GgmlDType::IQ4XS
+            | GgmlDType::IQ4NL => {
                 candle_core::bail!("Expected valid GGML ISQ type.")
             }
         }
