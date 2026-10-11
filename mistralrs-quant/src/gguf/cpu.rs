@@ -183,6 +183,31 @@ fn gemv<T: GgmlType>(
     let blocks: &[T] =
         unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<T>(), data.len() / block_bytes) };
 
+    // Measurement hook (IQ_DBG_UNION=1): per call, how many expert slots ran here
+    // versus how many distinct experts they touch. A verify step that is not
+    // grouped by expert reads one set per (token, topk) slot; grouping by expert
+    // would read only the distinct ones.
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ON.get_or_init(|| std::env::var_os("IQ_DBG_UNION").is_some()) {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static N: AtomicUsize = AtomicUsize::new(0);
+            let i = N.fetch_add(1, Ordering::Relaxed);
+            if i < 2000 {
+                let distinct = ids
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len();
+                println!(
+                    "IQ_DBG_UNION #{i} slots={} distinct={} tokens={tokens} x_t={x_t} topk={topk} n={n} k={k}",
+                    ids.len(),
+                    distinct
+                );
+            }
+        }
+    }
+
     // Each distinct activation row, quantized once for the vec-dot.
     let vd_row = k / T::VecDotType::BLCK_SIZE;
     let mut xq = vec![T::VecDotType::zeros(); tokens * x_t * vd_row];
