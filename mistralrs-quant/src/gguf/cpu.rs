@@ -493,6 +493,15 @@ mod throughput_bench {
         experts: usize,
         iters: usize,
     ) {
+        // Tuning instrument: ONLY=<substring> runs one type, VARIANT=1t|split one loop, so
+        // `perf stat` sees a single kernel instead of the whole table.
+        if let Ok(want) = std::env::var("ONLY") {
+            if !label.to_lowercase().contains(&want.to_lowercase()) {
+                return;
+            }
+        }
+        let variant = std::env::var("VARIANT").unwrap_or_else(|_| "both".into());
+        let (do_1t, do_split) = (variant != "split", variant != "1t");
         let rb = k / T::BLCK_SIZE;
         let row_bytes = rb * T::DTYPE.type_size();
         let n_rows = n * experts;
@@ -512,6 +521,9 @@ mod throughput_bench {
 
         let t = Instant::now();
         for _ in 0..iters {
+            if !do_1t {
+                break;
+            }
             for (o, row) in out.iter_mut().zip(blocks.chunks_exact(rb)) {
                 *o = T::vec_dot(k, row, &xq);
             }
@@ -521,6 +533,9 @@ mod throughput_bench {
         let mut dst = vec![0f32; n_rows];
         let t = Instant::now();
         for _ in 0..iters {
+            if !do_split {
+                break;
+            }
             dst.par_chunks_mut(n).enumerate().for_each(|(e, out)| {
                 let w = &blocks[e * n * rb..][..n * rb];
                 out.par_chunks_mut(ROWS_PER_TASK)
