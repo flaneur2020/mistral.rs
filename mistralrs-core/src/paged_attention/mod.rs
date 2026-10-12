@@ -77,8 +77,9 @@ pub(crate) fn block_aligned_sliding_window_start(
 #[cfg(test)]
 mod tests {
     use super::{
-        block_aligned_sliding_window_start, fit_post_load_cache_budget, MemoryGpuConfig,
-        PagedAttentionConfig, PagedCacheType,
+        block_aligned_sliding_window_start, fit_post_load_cache_budget, post_load_budget_detail,
+        MemoryGpuConfig, PagedAttentionConfig, PagedCacheType, RecurrentPrefixReservation,
+        SIZE_IN_MB,
     };
 
     #[test]
@@ -160,7 +161,7 @@ mod tests {
     #[test]
     fn post_load_cache_budget_preserves_memory_mode_semantics() -> anyhow::Result<()> {
         assert_eq!(
-            fit_post_load_cache_budget(MemoryGpuConfig::Utilization(0.85), 40_000, 35_000)?,
+            fit_post_load_cache_budget(MemoryGpuConfig::Utilization(0.85), 40_000, 35_000, "",)?,
             35_000
         );
         assert_eq!(
@@ -171,6 +172,7 @@ mod tests {
                 },
                 40_000,
                 35_000,
+                "",
             )?,
             35_000
         );
@@ -181,16 +183,58 @@ mod tests {
             },
             40_000,
             35_000,
+            "",
         )
         .is_err());
         assert!(
-            fit_post_load_cache_budget(MemoryGpuConfig::MbAmount(40_000), 40_000, 35_000,).is_err()
-        );
-        assert!(
-            fit_post_load_cache_budget(MemoryGpuConfig::ContextSize(131_072), 40_000, 35_000,)
+            fit_post_load_cache_budget(MemoryGpuConfig::MbAmount(40_000), 40_000, 35_000, "",)
                 .is_err()
         );
+        assert!(fit_post_load_cache_budget(
+            MemoryGpuConfig::ContextSize(131_072),
+            40_000,
+            35_000,
+            "",
+        )
+        .is_err());
         Ok(())
+    }
+
+    #[test]
+    fn post_load_budget_detail_names_the_tunable_share() {
+        // The numbers from a 4 GB expert-cache `serve` run on a 12 GB card: 1204 MB free, the
+        // 512 MB device reserve, and the default 16-prefix snapshot reservation of 1887 MB.
+        let prefix = RecurrentPrefixReservation {
+            bytes_per_snapshot: 111 * SIZE_IN_MB,
+            snapshots: 17,
+        };
+        assert_eq!(prefix.prefix_capacity(), 16);
+        assert_eq!(prefix.capacity_fitting_in(564 * SIZE_IN_MB), 4);
+
+        let detail = post_load_budget_detail(
+            1204 * SIZE_IN_MB,
+            692 * SIZE_IN_MB,
+            1887 * SIZE_IN_MB,
+            0,
+            Some(prefix),
+            128,
+        );
+        assert!(detail.contains("1204 MB free"), "{detail}");
+        assert!(detail.contains("512 MB device reserve"), "{detail}");
+        assert!(
+            detail.contains("1887 MB post-load reservations"),
+            "{detail}"
+        );
+        assert!(detail.contains("16 cached prefixes x 111 MB"), "{detail}");
+        assert!(detail.contains("at most 4 cached prefixes fit"), "{detail}");
+        assert!(
+            detail.contains("0 MB packed GGUF affine weights"),
+            "{detail}"
+        );
+
+        // Without a recurrent prefix cache there is nothing to trade, so there is no advice.
+        let plain = post_load_budget_detail(1204 * SIZE_IN_MB, 692 * SIZE_IN_MB, 0, 0, None, 128);
+        assert!(!plain.contains("tunable"), "{plain}");
     }
 
     #[test]
@@ -251,6 +295,38 @@ pub struct PagedAttentionConfig {
 pub struct CacheMemoryReservations {
     pub primary_device_bytes: usize,
     pub secondary_device_bytes: usize,
+    /// Of `primary_device_bytes`, the share held by the recurrent prefix snapshot cache.
+    pub recurrent_prefix_snapshot: Option<RecurrentPrefixReservation>,
+}
+
+/// The share of a post-load reservation held by the recurrent prefix snapshot cache.
+///
+/// Snapshots are materialized lazily, one per cached prefix, so the reservation is a worst case for
+/// the cache the prefix validator may fill. It is also the only part of the reservation a caller can
+/// trade away (`--prefix-cache-n` / `PagedAttentionConfig::with_recurrent_prefix_capacity`), because
+/// the KV cache request and the other components are requirements rather than caches.
+#[derive(Clone, Copy, Debug)]
+pub struct RecurrentPrefixReservation {
+    /// Bytes one snapshot costs on the primary device, across every recurrent pool there.
+    pub bytes_per_snapshot: usize,
+    /// Snapshots the reservation stands for, i.e. the configured prefix capacity plus one.
+    pub snapshots: usize,
+}
+
+impl RecurrentPrefixReservation {
+    /// The configured prefix capacity, as passed by `--prefix-cache-n`.
+    pub fn prefix_capacity(&self) -> usize {
+        self.snapshots.saturating_sub(1)
+    }
+
+    /// Prefix capacity that `budget_bytes` can hold: one snapshot costs `bytes_per_snapshot`, and a
+    /// usable cache additionally holds the snapshot of the live sequence.
+    pub fn capacity_fitting_in(&self, budget_bytes: usize) -> usize {
+        if self.bytes_per_snapshot == 0 {
+            return self.prefix_capacity();
+        }
+        (budget_bytes / self.bytes_per_snapshot).saturating_sub(1)
+    }
 }
 
 impl PagedAttentionConfig {
@@ -326,6 +402,7 @@ impl PagedAttentionConfig {
         Ok(CacheMemoryReservations {
             primary_device_bytes,
             secondary_device_bytes: self.mapped_activation_memory_reservation_bytes,
+            recurrent_prefix_snapshot: None,
         })
     }
 }
@@ -379,10 +456,57 @@ fn context_cache_size_mb(
         .div_ceil(SIZE_IN_MB)
 }
 
+/// Explains a post-load budget, and names what a caller could change to make room for the KV cache.
+///
+/// The KV cache request and the recurrent prefix snapshot reservation are sized independently, so a
+/// failure that only reports "safely available" is unactionable: the snapshot reservation can be
+/// several GB and is the only tunable component, since it caches prefixes rather than serving them.
+fn post_load_budget_detail(
+    free_bytes: usize,
+    capped_bytes: usize,
+    reserved_bytes: usize,
+    affine_bytes: usize,
+    prefix: Option<RecurrentPrefixReservation>,
+    requested_mb: usize,
+) -> String {
+    let mb = |bytes: usize| bytes.div_ceil(SIZE_IN_MB);
+    let mut detail = format!(
+        " Budget: {} MB free - {} MB device reserve - {} MB post-load reservations",
+        mb(free_bytes),
+        mb(free_bytes.saturating_sub(capped_bytes)),
+        mb(reserved_bytes),
+    );
+    let mut advice = String::new();
+    if let Some(prefix) = prefix {
+        let snapshot_bytes = prefix.bytes_per_snapshot.saturating_mul(prefix.snapshots);
+        // What is left for snapshots once the other reservations and the KV request are paid for.
+        let snapshot_budget_bytes = capped_bytes
+            .saturating_sub(reserved_bytes.saturating_sub(snapshot_bytes))
+            .saturating_sub(requested_mb.saturating_mul(SIZE_IN_MB));
+        detail.push_str(&format!(
+            " ({} MB of them for the recurrent prefix snapshot cache: {} cached prefixes x {} MB)",
+            mb(snapshot_bytes),
+            prefix.prefix_capacity(),
+            mb(prefix.bytes_per_snapshot),
+        ));
+        advice.push_str(&format!(
+            " The snapshot cache is the only tunable part: with this {requested_mb} MB KV cache at most {} cached prefixes fit, so lower `--prefix-cache-n` (currently {}).",
+            prefix.capacity_fitting_in(snapshot_budget_bytes),
+            prefix.prefix_capacity(),
+        ));
+    }
+    detail.push_str(&format!(
+        " - {} MB packed GGUF affine weights.{advice}",
+        mb(affine_bytes)
+    ));
+    detail
+}
+
 fn fit_post_load_cache_budget(
     config: MemoryGpuConfig,
     requested_mb: usize,
     available_mb: usize,
+    detail: &str,
 ) -> anyhow::Result<usize> {
     match config {
         MemoryGpuConfig::Utilization(_) => Ok(requested_mb.min(available_mb)),
@@ -391,7 +515,7 @@ fn fit_post_load_cache_budget(
             if let Some(minimum) = min_mb {
                 if fitted_mb < minimum {
                     anyhow::bail!(
-                        "PagedAttention KV cache has {available_mb} MB available, below the required best-effort minimum of {minimum} MB."
+                        "PagedAttention KV cache has {available_mb} MB available, below the required best-effort minimum of {minimum} MB.{detail}"
                     );
                 }
             }
@@ -400,7 +524,7 @@ fn fit_post_load_cache_budget(
         MemoryGpuConfig::MbAmount(_) | MemoryGpuConfig::ContextSize(_) => {
             if requested_mb > available_mb {
                 anyhow::bail!(
-                    "PagedAttention KV cache requires {requested_mb} MB but only {available_mb} MB is safely available after model loading."
+                    "PagedAttention KV cache requires {requested_mb} MB but only {available_mb} MB is safely available after model loading.{detail}"
                 );
             }
             Ok(requested_mb)
@@ -548,10 +672,17 @@ pub fn calculate_cache_config(
             }
         };
         if let Some(memory) = post_load_memory {
-            let available_mb = device_memory_cap(memory.available(), device)
-                .saturating_sub(future_reserved_bytes)
-                / SIZE_IN_MB;
-            mem_gpu_mb = fit_post_load_cache_budget(mem_gpu, mem_gpu_mb, available_mb)?;
+            let capped_bytes = device_memory_cap(memory.available(), device);
+            let available_mb = capped_bytes.saturating_sub(future_reserved_bytes) / SIZE_IN_MB;
+            let detail = post_load_budget_detail(
+                memory.available(),
+                capped_bytes,
+                reserved_bytes,
+                affine_bytes,
+                memory_reservations.recurrent_prefix_snapshot,
+                mem_gpu_mb,
+            );
+            mem_gpu_mb = fit_post_load_cache_budget(mem_gpu, mem_gpu_mb, available_mb, &detail)?;
         }
         min_mem_gpu = min_mem_gpu.min(mem_gpu_mb);
     }

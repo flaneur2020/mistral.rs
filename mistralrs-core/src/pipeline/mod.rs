@@ -35,7 +35,7 @@ use crate::device_map::DeviceMapper;
 use crate::layers_masker::PastKvLenCache;
 use crate::paged_attention::{
     AttentionBackendKind, CacheConfig, CacheEngine, CacheMemoryReservations, MemoryGpuConfig,
-    ModelConfigLike,
+    ModelConfigLike, RecurrentPrefixReservation,
 };
 use crate::prefix_cacher::{PagedAuxiliaryPrefixState, PrefixCacheManagerV2};
 use crate::IntervalLogger;
@@ -583,6 +583,7 @@ fn add_recurrent_prefix_memory_reservations(
         .checked_add(1)
         .ok_or_else(|| candle_core::Error::msg("recurrent prefix capacity overflow"))?;
     let mut secondary_prefix_bytes = 0usize;
+    let mut primary_snapshot_bytes = 0usize;
     for (device, bytes_per_snapshot) in bytes_by_device {
         let bytes = bytes_per_snapshot
             .checked_mul(peak_snapshots)
@@ -592,9 +593,19 @@ fn add_recurrent_prefix_memory_reservations(
                 .primary_device_bytes
                 .checked_add(bytes)
                 .ok_or_else(|| candle_core::Error::msg("recurrent prefix reservation overflow"))?;
+            // Remember the share so a sizing failure can point at `--prefix-cache-n`.
+            primary_snapshot_bytes = primary_snapshot_bytes
+                .checked_add(bytes_per_snapshot)
+                .ok_or_else(|| candle_core::Error::msg("recurrent prefix reservation overflow"))?;
         } else {
             secondary_prefix_bytes = secondary_prefix_bytes.max(bytes);
         }
+    }
+    if primary_snapshot_bytes > 0 {
+        reservations.recurrent_prefix_snapshot = Some(RecurrentPrefixReservation {
+            bytes_per_snapshot: primary_snapshot_bytes,
+            snapshots: peak_snapshots,
+        });
     }
     reservations.secondary_device_bytes = reservations
         .secondary_device_bytes
@@ -3349,6 +3360,7 @@ mod tests {
             CacheMemoryReservations {
                 primary_device_bytes: 100,
                 secondary_device_bytes: 50,
+                recurrent_prefix_snapshot: None,
             },
             HashMap::from([
                 (DeviceLocation::Cpu, 10),
