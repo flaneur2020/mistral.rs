@@ -7,6 +7,7 @@ pub mod driver;
 pub(crate) mod gdn_transitions;
 pub(crate) mod hybrid_state;
 pub mod logging;
+mod lookup;
 pub(crate) mod paged_rows;
 pub mod policy;
 pub mod proposer;

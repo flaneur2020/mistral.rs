@@ -15,6 +15,7 @@ use crate::IntervalLogger;
 
 use super::autotuner::{DraftOutcome, SpeculativeAutotuner};
 use super::cache::{SpeculativeCacheAccess, SpeculativeCacheGuard, SpeculativeCacheOutcome};
+use super::lookup::{observe_round, LookupDrafter};
 use super::proposer::{
     SpeculativeCommitRow, SpeculativeProposalBatch, SpeculativeProposalDistribution,
     SpeculativeProposeBatchCtx, SpeculativeProposePreparation, SpeculativeProposePrepareCtx,
@@ -136,6 +137,7 @@ fn plan_speculative_step<P>(
     target: &P,
     seq_ids: &[usize],
     depth_hint: Option<usize>,
+    sequences: &[&Sequence],
 ) -> Option<SpeculativeBatchPlan>
 where
     P: SpeculativePipelineExt,
@@ -148,7 +150,22 @@ where
         .expect("speculative autotuner poisoned");
     tuner.set_candidates(&candidates);
     if tuner.is_active() && plan.proposal_len > 0 {
-        plan.proposal_len = tuner.choose_with_hint(seq_ids, plan.proposal_len, depth_hint);
+        let native_len = plan.proposal_len;
+        plan.proposal_len = tuner.choose_with_hint(seq_ids, native_len, depth_hint);
+        // The autotuner drops to no speculation when the draft head's tokens are being rejected.
+        // Prompt lookup does not depend on that head, and the sequences that repeat their own
+        // context are exactly where the head is worst, so a lookup proposal keeps the step
+        // speculative instead of letting the engine bypass it. Off unless asked for.
+        if plan.proposal_len == 0 {
+            if let Some(drafter) = LookupDrafter::from_env(native_len) {
+                if sequences
+                    .iter()
+                    .any(|seq| drafter.propose(seq.get_toks()).is_some())
+                {
+                    plan.proposal_len = native_len;
+                }
+            }
+        }
     }
     Some(plan)
 }
@@ -215,7 +232,9 @@ where
             trim_mixed_staged_allocations(seqs, cache)?;
             clear_staged_speculative_tokens(seqs);
             let seq_ids = seqs.iter().map(|seq| *seq.id()).collect::<Vec<_>>();
-            let Some(plan) = plan_speculative_step(target, &seq_ids, depth_hint) else {
+            let plan_sequences = seqs.iter().map(|seq| &**seq).collect::<Vec<_>>();
+            let Some(plan) = plan_speculative_step(target, &seq_ids, depth_hint, &plan_sequences)
+            else {
                 return Ok(false);
             };
             if plan.proposal_len == 0 {
@@ -237,9 +256,13 @@ where
         }
         StagedBatchState::None => {
             let seq_ids = seqs.iter().map(|seq| *seq.id()).collect::<Vec<_>>();
-            let Some(plan) =
-                plan_speculative_step(target, &seq_ids, seqs[0].speculative_depth_hint())
-            else {
+            let plan_sequences = seqs.iter().map(|seq| &**seq).collect::<Vec<_>>();
+            let Some(plan) = plan_speculative_step(
+                target,
+                &seq_ids,
+                seqs[0].speculative_depth_hint(),
+                &plan_sequences,
+            ) else {
                 return Ok(false);
             };
             if plan.proposal_len == 0 {
@@ -575,6 +598,18 @@ where
             })
         })
         .collect::<Vec<_>>();
+    // Prompt lookup: tell the policy how many drafts this round accepted, so a match length that
+    // keeps being rejected stops being taken (W38: without this the feature loses 24%).
+    let observed = commit_rows
+        .iter()
+        .map(|row| {
+            let accepted = outcomes[row.batch_idx]
+                .as_ref()
+                .map_or(0, |outcome| outcome.accepted_drafts);
+            (*seqs[row.batch_idx].id(), accepted)
+        })
+        .collect::<Vec<_>>();
+    observe_round(&observed);
     commit_then_publish_verified_batch(
         target,
         |target| target.speculative_commit(&commit_rows),
@@ -723,7 +758,13 @@ where
         .map(|idx| *seqs[*idx].id())
         .collect::<Vec<_>>();
     let depth_hint = seqs[active_indices[0]].speculative_depth_hint();
-    let Some(plan) = plan.or_else(|| plan_speculative_step(target, &seq_ids, depth_hint)) else {
+    let plan_sequences = active_indices
+        .iter()
+        .map(|idx| &*seqs[*idx] as &Sequence)
+        .collect::<Vec<_>>();
+    let Some(plan) =
+        plan.or_else(|| plan_speculative_step(target, &seq_ids, depth_hint, &plan_sequences))
+    else {
         target.speculative_bypass(&seq_ids)?;
         clear_active_staged(seqs, active_indices);
         return Ok(());
@@ -776,7 +817,7 @@ where
             .lock()
             .expect("speculative autotuner poisoned")
             .begin_step(&seq_ids, proposal_len, started);
-        target.speculative_propose(SpeculativeProposeBatchCtx {
+        let mut batch = target.speculative_propose(SpeculativeProposeBatchCtx {
             proposal_len,
             sampled_tokens,
             sampled_tokens_emitted: true,
@@ -788,7 +829,17 @@ where
             target_rows: &target_rows,
             preparation,
             rng: rng.clone(),
-        })?
+        })?;
+        // Prompt lookup (MISTRALRS_LOOKUP_DRAFT, off by default): a sequence that repeats its own
+        // context - a code edit, a quoted block - can be drafted exactly, and the verify window
+        // commits several tokens. Wrapped here rather than in a model so every model gets it, and
+        // capped to the draft window the verify batch was planned for.
+        if let Some(drafter) = LookupDrafter::from_env(proposal_len) {
+            if let Some(batch) = batch.as_mut() {
+                drafter.apply(batch, &sequences);
+            }
+        }
+        batch
     };
 
     let Some(proposal_batch) = proposal_batch else {
