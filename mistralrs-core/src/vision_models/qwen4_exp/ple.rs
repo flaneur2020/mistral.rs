@@ -35,6 +35,32 @@ const PLANNED_RESIDENT_BITS: usize = 4;
 const RESIDENT_COPY_ROWS: usize = 1 << 20;
 
 #[cfg(feature = "cuda")]
+/// Measurement hook (`PLE_DBG=1`): what the per-step host gather of the n-gram table costs.
+///
+/// The table does not fit in device memory, so every decode step gathers its rows on the host and
+/// copies them over; this is the only place that cost is visible.
+fn ple_gather_probe(nanos: usize, rows: usize) {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("PLE_DBG").is_some()) {
+        return;
+    }
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    static NS: AtomicUsize = AtomicUsize::new(0);
+    static ROWS: AtomicUsize = AtomicUsize::new(0);
+    let n = CALLS.fetch_add(1, Relaxed) + 1;
+    NS.fetch_add(nanos, Relaxed);
+    ROWS.fetch_add(rows, Relaxed);
+    if n % 50 == 0 {
+        eprintln!(
+            "PLE probe: {n} gather calls, cumulative {:.1} ms, {:.2} ms/call, {:.0} rows/call",
+            NS.load(Relaxed) as f64 / 1e6,
+            NS.load(Relaxed) as f64 / n as f64 / 1e6,
+            ROWS.load(Relaxed) as f64 / n as f64,
+        );
+    }
+}
+
 fn resident_bytes(rows: usize, head_dim: usize, bits: usize) -> usize {
     rows * (head_dim * bits / 8 + head_dim / RESIDENT_GROUP * 2)
 }
@@ -999,7 +1025,9 @@ impl PleLayer {
             let row = Tensor::from_vec(tail, (1, context), state.history.device())?;
             state.history.slice_set(&row, 0, slots[seq] as usize)?;
         }
+        let gather_start = std::time::Instant::now();
         let emb = self.table.gather_host(&rows, state.conv.device())?;
+        ple_gather_probe(gather_start.elapsed().as_nanos() as usize, rows.len());
         emb.reshape((n_tokens, heads * self.table.head_dim))
     }
 

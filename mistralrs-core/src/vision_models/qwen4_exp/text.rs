@@ -187,6 +187,7 @@ impl SparseMoeBlock {
     }
 
     pub(super) fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let block_start = std::time::Instant::now();
         let (b_size, seq_len, hidden_dim) = xs.dims3()?;
         let xs_flat = xs.reshape(((), hidden_dim))?;
         let router_logits = self.gate.forward(&xs_flat)?;
@@ -208,9 +209,18 @@ impl SparseMoeBlock {
             SparseMoeExperts::Builtin(experts) => experts,
             SparseMoeExperts::External(experts) => experts.as_ref(),
         };
+        // Measurement hook (MOE_DBG=1): the routed-experts call is where every expert read, the CPU
+        // misses and the PCIe DMA happen, so its share of the token is the one number the offload
+        // work is judged by.
+        let hook_start = std::time::Instant::now();
         let y = experts
             .forward(xs, topk.values, &topk.indices)?
             .reshape((b_size, seq_len, hidden_dim))?;
+        let hook_nanos = hook_start.elapsed().as_nanos() as usize;
+        // The whole block, so the router, the shared expert and the residual come out as the
+        // difference rather than as part of "everything else".
+        let block_nanos = block_start.elapsed().as_nanos() as usize;
+        moe_block_probe(block_nanos, hook_nanos);
         let shared_gate = candle_nn::ops::sigmoid(&self.shared_expert_gate.forward(&xs_flat)?)?
             .reshape((b_size, seq_len, 1))?;
         let shared_out = self
@@ -218,6 +228,36 @@ impl SparseMoeBlock {
             .forward(xs)?
             .broadcast_mul(&shared_gate)?;
         y + shared_out
+    }
+}
+
+/// Measurement hook (`MOE_DBG=1`): the per-call split of a MoE block.
+///
+/// `hook` is the routed-experts call - every expert read, the CPU misses and the PCIe DMA - and
+/// `block` adds the router, the shared expert and the residual. Multiplying the per-token figure by
+/// the layer count is what the offload work is judged by; what is left of the token is attention,
+/// GDN, PLE, sampling and synchronisation.
+fn moe_block_probe(block_nanos: usize, hook_nanos: usize) {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("MOE_DBG").is_some()) {
+        return;
+    }
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    static BLOCK_NS: AtomicUsize = AtomicUsize::new(0);
+    static HOOK_NS: AtomicUsize = AtomicUsize::new(0);
+    let n = CALLS.fetch_add(1, Relaxed) + 1;
+    BLOCK_NS.fetch_add(block_nanos, Relaxed);
+    HOOK_NS.fetch_add(hook_nanos, Relaxed);
+    // Cumulative, so the caller can divide by the tokens the run actually generated: with MTP the
+    // number of 48-layer passes per generated token is not a constant anyone can assume.
+    if n % 480 == 0 {
+        let block = BLOCK_NS.load(Relaxed) as f64 / 1e6;
+        let hook = HOOK_NS.load(Relaxed) as f64 / 1e6;
+        eprintln!(
+            "MoE probe: {n} calls, cumulative block {block:.1} ms (experts {hook:.1} ms), {:.3} ms/call block",
+            block / n as f64 * 1000.0,
+        );
     }
 }
 
