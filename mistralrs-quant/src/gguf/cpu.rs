@@ -216,20 +216,64 @@ fn gemv<T: GgmlType>(
         .for_each(|(dst, src)| T::VecDotType::from_float(src, dst));
 
     let mut dst = vec![0f32; tokens * topk * n];
-    // Rows are split too: a decode step often routes only a couple of experts here (the rest
-    // run elsewhere), which would otherwise leave all but a couple of threads idle.
-    dst.par_chunks_mut(n).enumerate().for_each(|(slot, out)| {
+
+    // Slots that share both an expert and an activation row produce bit-identical outputs, so
+    // they only need one dot product between them. That happens for 21% of an MTP verify
+    // batch's slots (its three tokens often share one activation row *and* route to the same
+    // experts), where the old per-slot loop recomputed the same dot. Grouping by the pair
+    // rather than by the expert alone is what makes the saving real: deduping the weight
+    // *reads* only, as an earlier attempt did, still executed every slot.
+    use std::collections::HashMap;
+    let xrow_of = |slot: usize| -> usize {
         let (t, j) = (slot / topk, slot % topk);
-        let xrow = t * x_t + if x_t == 1 { 0 } else { j };
-        let x = &xq[xrow * vd_row..(xrow + 1) * vd_row];
-        let w = &blocks[ids[slot] as usize * expert_blocks..][..expert_blocks];
-        out.par_chunks_mut(ROWS_PER_TASK)
-            .zip(w.par_chunks(ROWS_PER_TASK * row_blocks))
-            .for_each(|(out, w)| {
-                for (o, row) in out.iter_mut().zip(w.chunks_exact(row_blocks)) {
-                    *o = T::vec_dot(k, row, x);
-                }
-            });
+        t * x_t + if x_t == 1 { 0 } else { j }
+    };
+    let mut by_pair: HashMap<(u32, usize), Vec<u32>> = HashMap::with_capacity(ids.len());
+    for (slot, &expert) in ids.iter().enumerate() {
+        by_pair
+            .entry((expert, xrow_of(slot)))
+            .or_default()
+            .push(slot as u32);
+    }
+    let mut groups: Vec<((u32, usize), Vec<u32>)> = by_pair.into_iter().collect();
+    groups.sort_unstable_by_key(|(key, _)| *key); // walk the expert stack in order
+
+    // One task per (group, row block): enough tasks to fill the threads even when a decode
+    // step routes only a couple of experts here.
+    let tasks: Vec<((u32, usize), usize, &[u32])> = groups
+        .iter()
+        .flat_map(|(key, slots)| {
+            (0..n.div_ceil(ROWS_PER_TASK)).map(move |c| (*key, c, slots.as_slice()))
+        })
+        .collect();
+
+    // SAFETY: the tasks write disjoint elements — a slot belongs to exactly one group, and
+    // within a group each task owns a distinct block of output rows. `set` takes `&self` so
+    // the rayon closure captures this (Send + Sync) wrapper, not the bare pointer.
+    struct Out(*mut f32);
+    unsafe impl Send for Out {}
+    unsafe impl Sync for Out {}
+    impl Out {
+        #[inline]
+        unsafe fn set(&self, index: usize, value: f32) {
+            *self.0.add(index) = value;
+        }
+    }
+    let out = Out(dst.as_mut_ptr());
+    tasks.par_iter().for_each(|((expert, xrow), chunk, slots)| {
+        let w = &blocks[*expert as usize * expert_blocks..][..expert_blocks];
+        let x = &xq[*xrow * vd_row..(*xrow + 1) * vd_row];
+        let r0 = chunk * ROWS_PER_TASK;
+        let take = (n - r0).min(ROWS_PER_TASK);
+        let rows = &w[r0 * row_blocks..(r0 + take) * row_blocks];
+        for (i, row) in rows.chunks_exact(row_blocks).enumerate() {
+            let orow = r0 + i;
+            let value = T::vec_dot(k, row, x);
+            for &slot in *slots {
+                // SAFETY: see `Out`.
+                unsafe { out.set(slot as usize * n + orow, value) };
+            }
+        }
     });
     Ok(dst)
 }
