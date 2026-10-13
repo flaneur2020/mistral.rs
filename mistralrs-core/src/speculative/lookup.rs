@@ -28,6 +28,9 @@ use std::sync::{Mutex, OnceLock};
 #[derive(Clone, Copy, Default)]
 struct Bucket {
     samples: u32,
+    /// Drafts this bucket's proposals put in front of the verifier, and how many of them it kept.
+    /// The gate is a rate over tokens, not over rounds: a proposal is up to eight drafts long.
+    proposed: u32,
     accepted: u32,
 }
 
@@ -80,6 +83,7 @@ pub(crate) fn observe_round(rows: &[(usize, usize)]) {
         let (_, bucket, drafts) = p.remove(pos);
         let entry = &mut policy[bucket];
         entry.samples += 1;
+        entry.proposed += drafts as u32;
         // Drafts are verified in order, so the lookup's own share of the window is its prefix.
         entry.accepted += (*accepted).min(drafts) as u32;
         seen += 1;
@@ -91,12 +95,12 @@ pub(crate) fn observe_round(rows: &[(usize, usize)]) {
             let rates = policy
                 .iter()
                 .map(|b| {
-                    if b.samples == 0 {
+                    if b.proposed == 0 {
                         "-".to_string()
                     } else {
                         format!(
                             "{:.2}({})",
-                            f64::from(b.accepted) / f64::from(b.samples),
+                            f64::from(b.accepted) / f64::from(b.proposed),
                             b.samples
                         )
                     }
@@ -270,7 +274,7 @@ impl LookupDrafter {
                     let b = p[bucket];
                     (
                         b.samples,
-                        f64::from(b.accepted) / f64::from(b.samples.max(1)),
+                        f64::from(b.accepted) / f64::from(b.proposed.max(1)),
                     )
                 }
                 Err(_) => (MIN_SAMPLES, 1.0),
