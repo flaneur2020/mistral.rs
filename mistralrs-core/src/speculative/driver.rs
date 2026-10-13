@@ -610,6 +610,30 @@ where
         })
         .collect::<Vec<_>>();
     observe_round(&observed);
+    // MTP_DBG: proposed/accepted drafts and tokens per round. Instrument only (like MOE_DBG), so the
+    // acceptance rate of a draft depth can be read from a bench run without a tokenizer or a server.
+    if std::env::var_os("MTP_DBG").is_some() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static ROUNDS: AtomicU64 = AtomicU64::new(0);
+        static PROPOSED: AtomicU64 = AtomicU64::new(0);
+        static ACCEPTED: AtomicU64 = AtomicU64::new(0);
+        let (p, a) = outcomes.iter().flatten().fold((0u64, 0u64), |(p, a), o| {
+            (p + o.proposed_drafts as u64, a + o.accepted_drafts as u64)
+        });
+        let r = ROUNDS.fetch_add(1, Ordering::Relaxed) + 1;
+        let tp = PROPOSED.fetch_add(p, Ordering::Relaxed) + p;
+        let ta = ACCEPTED.fetch_add(a, Ordering::Relaxed) + a;
+        if r <= 2 || r % 8 == 0 {
+            eprintln!(
+                "MTP_DBG round {r}: proposed {p} accepted {a} | cumulative proposed {tp} accepted {ta}"
+            );
+            eprintln!(
+                "MTP_DBG   acceptance {:.3}, tokens/round {:.2}",
+                ta as f64 / tp.max(1) as f64,
+                (ta + r) as f64 / r as f64
+            );
+        }
+    }
     commit_then_publish_verified_batch(
         target,
         |target| target.speculative_commit(&commit_rows),
